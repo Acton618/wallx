@@ -57,6 +57,71 @@ from pprint import pprint
 logger = logging.get_logger(__name__)
 
 
+# PERF PROFILING ADDED START: GPU-safe timing and FLOPs helpers.
+class _InferencePerfTimer:
+    """CUDA Event timer with a CPU fallback for explicit inference profiling."""
+
+    def __init__(self, enabled: bool, device: Optional[torch.device] = None):
+        self.enabled = enabled
+        self.timings_ms = {}
+        self._starts = {}
+        self.device = torch.device(device) if device is not None else None
+        self.use_cuda = (
+            enabled
+            and self.device is not None
+            and self.device.type == "cuda"
+            and torch.cuda.is_available()
+        )
+
+    def start(self, name: str):
+        if not self.enabled:
+            return
+        if self.use_cuda:
+            torch.cuda.synchronize(self.device)
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(torch.cuda.current_stream(self.device))
+            self._starts[name] = (start_event, end_event)
+        else:
+            self._starts[name] = time.perf_counter()
+
+    def stop(self, name: str):
+        if not self.enabled:
+            return None
+        start = self._starts.pop(name, None)
+        if start is None:
+            return None
+        if self.use_cuda:
+            start_event, end_event = start
+            end_event.record(torch.cuda.current_stream(self.device))
+            torch.cuda.synchronize(self.device)
+            elapsed_ms = start_event.elapsed_time(end_event)
+        else:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+        self.timings_ms[name] = elapsed_ms
+        return elapsed_ms
+
+    def seconds(self):
+        return {name: value / 1000.0 for name, value in self.timings_ms.items()}
+
+
+class _ForwardFlopWrapper(nn.Module):
+    def __init__(self, model, mode, predict_mode, forward_kwargs):
+        super().__init__()
+        self.model = model
+        self.mode = mode
+        self.predict_mode = predict_mode
+        self.forward_kwargs = forward_kwargs
+
+    def forward(self):
+        return self.model(
+            mode=self.mode, predict_mode=self.predict_mode, **self.forward_kwargs
+        )
+
+
+# PERF PROFILING ADDED END: GPU-safe timing and FLOPs helpers.
+
+
 @dataclass
 class Qwen2_5_VLACausalLMOutputWithPast(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
@@ -1991,11 +2056,19 @@ class Qwen2_5_VLMoEForAction(
         dof_mask: Optional[torch.FloatTensor] = None,
         agent_pos_mask: Optional[torch.FloatTensor] = None,
         unnorm: Optional[bool] = True,
+        # PERF PROFILING ADDED: opt-in CUDA Event timing switches.
+        profile_timing: Optional[bool] = False,
+        print_timing: Optional[bool] = False,
         **kwargs,
     ):
 
-        total_start_time = time.time()
-        timing_results = {}
+        # PERF PROFILING ADDED START: initialize the opt-in inference timer.
+        timer_device = (
+            input_ids.device if input_ids is not None else inputs_embeds.device
+        )
+        perf_timer = _InferencePerfTimer(profile_timing, timer_device)
+        perf_timer.start("total_time")
+        # PERF PROFILING ADDED END: initialize the opt-in inference timer.
 
         batch_size = (
             input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
@@ -2014,12 +2087,16 @@ class Qwen2_5_VLMoEForAction(
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
-        embed_start_time = time.time()
+        # PERF PROFILING ADDED: measure embedding plus multimodal input preparation.
+        perf_timer.start("embed_processing")
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
+                # PERF PROFILING ADDED: isolate image vision tower latency.
+                perf_timer.start("vision_image_forward")
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                perf_timer.stop("vision_image_forward")
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
                 if n_image_tokens != n_image_features:
@@ -2039,7 +2116,10 @@ class Qwen2_5_VLMoEForAction(
 
             if pixel_values_videos is not None:
                 pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+                # PERF PROFILING ADDED: isolate video vision tower latency.
+                perf_timer.start("vision_video_forward")
                 video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                perf_timer.stop("vision_video_forward")
                 n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
                 n_video_features = video_embeds.shape[0]
                 if n_video_tokens != n_video_features:
@@ -2079,9 +2159,10 @@ class Qwen2_5_VLMoEForAction(
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
-        timing_results["embed_processing"] = time.time() - embed_start_time
+        perf_timer.stop("embed_processing")
 
-        position_start_time = time.time()
+        # PERF PROFILING ADDED: measure RoPE and expert index preparation.
+        perf_timer.start("position_encoding")
         # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
         if position_ids is None and (
             attention_mask is None or attention_mask.ndim == 2
@@ -2127,9 +2208,10 @@ class Qwen2_5_VLMoEForAction(
             start_indices = torch.cumsum(group_size, dim=0) - group_size
             end_indices = torch.cumsum(group_size, dim=0)
 
-        timing_results["position_encoding"] = time.time() - position_start_time
+        perf_timer.stop("position_encoding")
 
-        action_init_start_time = time.time()
+        # PERF PROFILING ADDED: measure diffusion action initialization.
+        perf_timer.start("action_initialization")
         if action_chunk is not None:
             action_chunk = action_chunk.to(inputs_embeds.device).to(torch.float32)
 
@@ -2165,9 +2247,10 @@ class Qwen2_5_VLMoEForAction(
 
         inputs_embeds[flow_action_mask] = action_embed
 
-        timing_results["action_initialization"] = time.time() - action_init_start_time
+        perf_timer.stop("action_initialization")
 
-        prefetch_start_time = time.time()
+        # PERF PROFILING ADDED: measure the full-prefix transformer prefill.
+        perf_timer.start("prefetch_forward")
         prefetch_output = self.model(
             input_ids=None,
             attention_mask=attention_mask,
@@ -2205,9 +2288,10 @@ class Qwen2_5_VLMoEForAction(
             batch_size, action_horizon, action_dim
         )
 
-        timing_results["prefetch_forward"] = time.time() - prefetch_start_time
+        perf_timer.stop("prefetch_forward")
 
-        cache_prep_start_time = time.time()
+        # PERF PROFILING ADDED: measure KV-cache and postfix mask preparation.
+        perf_timer.start("cache_preprocessing")
 
         if prefix_length is None:
             has_true = flow_action_mask.any(dim=1)
@@ -2286,9 +2370,10 @@ class Qwen2_5_VLMoEForAction(
             # Set the columns corresponding to the padding positions to False (the key position is the padding).
             _postfix_attention_mask[batch_idx, :, full_padding_mask[batch_idx]] = False
 
-        timing_results["cache_preprocessing"] = time.time() - cache_prep_start_time
+        perf_timer.stop("cache_preprocessing")
 
-        ode_start_time = time.time()
+        # PERF PROFILING ADDED: measure iterative flow/ODE decoding with KV-cache.
+        perf_timer.start("ode_integration")
 
         def step_with_kvcache(timestep, noisy_action):
             action_mask = (
@@ -2334,9 +2419,10 @@ class Qwen2_5_VLMoEForAction(
             step_with_kvcache, noisy_action, times[1:], method="euler"
         )
 
-        timing_results["ode_integration"] = time.time() - ode_start_time
+        perf_timer.stop("ode_integration")
 
-        postprocess_start_time = time.time()
+        # PERF PROFILING ADDED: measure action unnormalization/output assembly.
+        perf_timer.start("postprocessing")
         predict_action = action_trajectory[-1]
         if unnorm:
             predict_action = (
@@ -2353,12 +2439,69 @@ class Qwen2_5_VLMoEForAction(
                 )
             )
 
-        timing_results["postprocessing"] = time.time() - postprocess_start_time
-        timing_results["total_time"] = time.time() - total_start_time
+        perf_timer.stop("postprocessing")
+        perf_timer.stop("total_time")
 
-        output["timing_results"] = timing_results
+        # PERF PROFILING ADDED: expose timing results without changing prediction tensors.
+        output["timing_results_ms"] = perf_timer.timings_ms
+        output["timing_results"] = perf_timer.seconds()
+        if profile_timing and print_timing:
+            for name, elapsed_ms in perf_timer.timings_ms.items():
+                print(f"[PERF] {name}: {elapsed_ms:.3f} ms", flush=True)
 
         return output
+
+
+    # PERF PROFILING ADDED START: optional fvcore FLOPs analysis entrypoint.
+    def profile_flops(
+        self,
+        mode: Optional[str] = "predict",
+        predict_mode: Optional[str] = "text",
+        print_by_module: bool = False,
+        print_parameter_count: bool = False,
+        **forward_kwargs,
+    ) -> Dict[str, Any]:
+        """Profile single-call FLOPs with fvcore when it is installed.
+
+        This is intended for offline complexity comparison between the baseline
+        and a pruned visual-token path. It should not be called in the hot path.
+        """
+        try:
+            from fvcore.nn import FlopCountAnalysis, parameter_count_table
+        except ImportError as exc:
+            return {
+                "flops": None,
+                "gflops": None,
+                "warning": f"fvcore is not installed: {exc}",
+            }
+
+        was_training = self.training
+        self.eval()
+        wrapper = _ForwardFlopWrapper(self, mode, predict_mode, forward_kwargs)
+        try:
+            with torch.no_grad():
+                analyzer = FlopCountAnalysis(wrapper, ())
+                total_flops = analyzer.total()
+            result = {
+                "flops": total_flops,
+                "gflops": total_flops / 1e9,
+            }
+            if print_by_module:
+                result["by_module"] = analyzer.by_module()
+            if print_parameter_count:
+                result["parameter_count_table"] = parameter_count_table(self)
+            print(f"[PERF] Model Complexity: {result['gflops']:.3f} GFLOPs")
+            return result
+        except Exception as exc:
+            return {
+                "flops": None,
+                "gflops": None,
+                "warning": f"FLOPs calculation failed: {exc}",
+            }
+        finally:
+            self.train(was_training)
+
+    # PERF PROFILING ADDED END: optional fvcore FLOPs analysis entrypoint.
 
     def forward(
         self, mode: Optional[str] = None, predict_mode: Optional[str] = "text", **kwargs
