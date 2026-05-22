@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Dict, Any, List
 import torch
 import copy
@@ -76,6 +77,14 @@ class WallXPolicy(BasePolicy):
         self.predict_mode = predict_mode
         self.default_prompt = default_prompt
         self.camera_key = camera_key
+        self.profile_timing = os.getenv("WALLX_PROFILE_TIMING", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if self.profile_timing:
+            logger.info("Wall-X inference timing is enabled by WALLX_PROFILE_TIMING")
 
         # Image preprocessing config
         self.min_pixels = min_pixels
@@ -161,6 +170,8 @@ class WallXPolicy(BasePolicy):
                     action_horizon=self.pred_horizon,
                     mode="predict",
                     predict_mode=self.predict_mode,
+                    profile_timing=self.profile_timing,
+                    print_timing=self.profile_timing,
                 )
 
             if outputs["predict_action"] is None:
