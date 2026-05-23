@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import yaml
 import numpy as np
@@ -36,7 +37,11 @@ from transformers.modeling_outputs import (
 from wall_x.fusions import ops
 from wall_x.model.action_head import ActionProcessor
 from wall_x.model.qwen2_5_based.configuration_qwen2_5_vl import Qwen2_5_VLConfig
-from wall_x.model.model_utils import load_wallx_processors, update_model_config
+from wall_x.model.model_utils import (
+    load_wallx_processors,
+    update_model_config,
+    num_floating_point_operations,
+)
 from wall_x.model.qwen2_5_based.modeling_qwen2_5_vl import (
     Qwen2_5_VisionTransformerPretrainedModel,
     Qwen2_5_VLAttention,
@@ -2020,6 +2025,280 @@ class Qwen2_5_VLMoEForAction(
 
         return output
 
+    def _log_complexity_track(
+        self,
+        input_ids,
+        attention_mask=None,
+        **complexity_kwargs,
+    ):
+        """Estimate token-level and coarse FLOPs complexity for vispruner analysis."""
+        if input_ids is None:
+            print(
+                "[COMPLEXITY_TRACK] input_ids unavailable; skip complexity estimate",
+                flush=True,
+            )
+            return None
+
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=device)
+        else:
+            if attention_mask.ndim == 1:
+                attention_mask = attention_mask.unsqueeze(0)
+            attention_mask = attention_mask.to(device=device).bool()
+
+        image_token_id = self.config.image_token_id
+        video_token_id = self.config.video_token_id
+        action_token_id = self.action_token_id_set.get("action_token_id", None)
+        fast_action_token_list = self.action_token_id_set.get("fast_action_token_list", [])
+        fast_action_token_tensor = None
+        if fast_action_token_list:
+            fast_action_token_tensor = torch.tensor(
+                fast_action_token_list, device=device, dtype=input_ids.dtype
+            )
+
+        def _resolve_scalar_like(value, sample_idx):
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                return float(value)
+            if torch.is_tensor(value):
+                if value.ndim == 0:
+                    return float(value.item())
+                if value.ndim == 1:
+                    if value.numel() == 1:
+                        return float(value.item())
+                    if value.numel() == batch_size and sample_idx < value.numel():
+                        return float(value[sample_idx].item())
+                    return float(value.flatten()[0].item())
+                if value.shape[0] == batch_size:
+                    sample_value = value[sample_idx]
+                    if sample_value.ndim == 0:
+                        return float(sample_value.item())
+                    if sample_value.numel() == 1:
+                        return float(sample_value.item())
+                    return float(sample_value.flatten()[0].item())
+                return float(value.flatten()[0].item())
+            if isinstance(value, (list, tuple)):
+                if len(value) == 1:
+                    return _resolve_scalar_like(value[0], sample_idx)
+                if len(value) == batch_size and sample_idx < len(value):
+                    return _resolve_scalar_like(value[sample_idx], sample_idx)
+            return None
+
+        def _resolve_count_like(value, sample_idx):
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                return max(0, int(math.ceil(float(value))))
+            if torch.is_tensor(value):
+                if value.ndim == 0:
+                    return max(0, int(math.ceil(float(value.item()))))
+                if value.dtype == torch.bool:
+                    if value.ndim == 1 and value.numel() != batch_size:
+                        return int(value.sum().item())
+                    if value.ndim >= 2 and value.shape[0] == batch_size:
+                        return int(value[sample_idx].sum().item())
+                    return int(value.sum().item())
+                if value.ndim == 1:
+                    if value.numel() == 1:
+                        return int(value.item())
+                    if value.numel() == batch_size and sample_idx < value.numel():
+                        return int(value[sample_idx].item())
+                    if sample_idx < value.numel():
+                        return int(value[sample_idx].item())
+                    return int(value.flatten()[0].item())
+                if value.shape[0] == batch_size:
+                    sample_value = value[sample_idx]
+                    if sample_value.ndim == 0:
+                        return int(sample_value.item())
+                    if sample_value.dtype == torch.bool:
+                        return int(sample_value.sum().item())
+                    return int(sample_value.shape[0])
+                if value.dtype == torch.bool:
+                    return int(value.sum().item())
+                return int(value.shape[0])
+            if isinstance(value, (list, tuple)):
+                if len(value) == 1:
+                    return _resolve_count_like(value[0], sample_idx)
+                if len(value) == batch_size and sample_idx < len(value):
+                    return _resolve_count_like(value[sample_idx], sample_idx)
+            return None
+
+        def _resolve_vision_tokens_after(sample_idx, vision_before):
+            for key in (
+                "vision_tokens_after",
+                "vision_token_count_after",
+                "pruned_vision_token_count",
+            ):
+                count_value = _resolve_count_like(complexity_kwargs.get(key), sample_idx)
+                if count_value is not None:
+                    return max(0, count_value)
+
+            for key in ("vision_keep_ratio", "vispruner_keep_ratio"):
+                ratio_value = _resolve_scalar_like(complexity_kwargs.get(key), sample_idx)
+                if ratio_value is not None:
+                    if ratio_value <= 0:
+                        return 0
+                    return max(1, int(math.ceil(vision_before * ratio_value)))
+
+            for key in ("vision_token_mask_after", "pruned_vision_token_mask", "vision_keep_mask"):
+                count_value = _resolve_count_like(complexity_kwargs.get(key), sample_idx)
+                if count_value is not None:
+                    return max(0, count_value)
+
+            return vision_before
+
+        total_vision_before = 0
+        total_vision_after = 0
+        total_text = 0
+        total_action = 0
+        total_seq_before = 0
+        total_seq_after = 0
+        attention_before_cost = 0.0
+        attention_after_cost = 0.0
+        estimated_flops_before = 0
+        estimated_flops_after = 0
+        estimated_flops_available = True
+        estimated_flops_error = None
+
+        for sample_idx in range(batch_size):
+            valid_mask = attention_mask[sample_idx]
+            valid_tokens = int(valid_mask.sum().item())
+
+            vision_mask = (
+                (input_ids[sample_idx] == image_token_id)
+                | (input_ids[sample_idx] == video_token_id)
+            ) & valid_mask
+            vision_tokens_before = int(vision_mask.sum().item())
+
+            action_tokens = 0
+            if action_token_id is not None:
+                action_tokens += int(
+                    ((input_ids[sample_idx] == action_token_id) & valid_mask).sum().item()
+                )
+            if fast_action_token_tensor is not None:
+                action_tokens += int(
+                    (torch.isin(input_ids[sample_idx], fast_action_token_tensor) & valid_mask)
+                    .sum()
+                    .item()
+                )
+
+            text_tokens = max(valid_tokens - vision_tokens_before - action_tokens, 0)
+            vision_tokens_after = _resolve_vision_tokens_after(
+                sample_idx, vision_tokens_before
+            )
+
+            seq_len_before = text_tokens + vision_tokens_before + action_tokens
+            seq_len_after = text_tokens + vision_tokens_after + action_tokens
+
+            total_vision_before += vision_tokens_before
+            total_vision_after += vision_tokens_after
+            total_text += text_tokens
+            total_action += action_tokens
+            total_seq_before += seq_len_before
+            total_seq_after += seq_len_after
+            attention_before_cost += float(seq_len_before**2)
+            attention_after_cost += float(seq_len_after**2)
+
+            if estimated_flops_available:
+                try:
+                    estimated_flops_before += num_floating_point_operations(
+                        self.config,
+                        batch_size=1,
+                        num_lang_tokens=text_tokens,
+                        num_action_tokens=action_tokens,
+                        vision_seq_length=vision_tokens_before,
+                    )
+                    estimated_flops_after += num_floating_point_operations(
+                        self.config,
+                        batch_size=1,
+                        num_lang_tokens=text_tokens,
+                        num_action_tokens=action_tokens,
+                        vision_seq_length=vision_tokens_after,
+                    )
+                except Exception as exc:
+                    estimated_flops_available = False
+                    estimated_flops_error = str(exc)
+
+        attention_ratio = (
+            attention_after_cost / attention_before_cost
+            if attention_before_cost > 0
+            else 1.0
+        )
+        estimated_attention_reduction = max(0.0, 1.0 - attention_ratio)
+
+        print(
+            f"[COMPLEXITY_TRACK] vision_tokens_before={total_vision_before}",
+            flush=True,
+        )
+        print(
+            f"[COMPLEXITY_TRACK] vision_tokens_after={total_vision_after}",
+            flush=True,
+        )
+        print(f"[COMPLEXITY_TRACK] text_tokens={total_text}", flush=True)
+        print(f"[COMPLEXITY_TRACK] action_tokens={total_action}", flush=True)
+        print(f"[COMPLEXITY_TRACK] seq_len_before={total_seq_before}", flush=True)
+        print(f"[COMPLEXITY_TRACK] seq_len_after={total_seq_after}", flush=True)
+        print(f"[COMPLEXITY_TRACK] attention_ratio={attention_ratio:.6f}", flush=True)
+        print(
+            f"[COMPLEXITY_TRACK] estimated_attention_reduction={estimated_attention_reduction * 100:.2f}%",
+            flush=True,
+        )
+
+        if estimated_flops_available:
+            print(
+                f"[COMPLEXITY_TRACK] estimated_train_flops_before={estimated_flops_before}",
+                flush=True,
+            )
+            print(
+                f"[COMPLEXITY_TRACK] estimated_train_flops_after={estimated_flops_after}",
+                flush=True,
+            )
+            if estimated_flops_before > 0:
+                estimated_flops_ratio = estimated_flops_after / estimated_flops_before
+                print(
+                    f"[COMPLEXITY_TRACK] estimated_train_flops_ratio={estimated_flops_ratio:.6f}",
+                    flush=True,
+                )
+                print(
+                    f"[COMPLEXITY_TRACK] estimated_train_flops_reduction={(1.0 - estimated_flops_ratio) * 100:.2f}%",
+                    flush=True,
+                )
+        else:
+            print(
+                f"[COMPLEXITY_TRACK] estimated_train_flops=unavailable ({estimated_flops_error})",
+                flush=True,
+            )
+
+        return {
+            "vision_tokens_before": total_vision_before,
+            "vision_tokens_after": total_vision_after,
+            "text_tokens": total_text,
+            "action_tokens": total_action,
+            "seq_len_before": total_seq_before,
+            "seq_len_after": total_seq_after,
+            "attention_ratio": attention_ratio,
+            "estimated_attention_reduction": estimated_attention_reduction,
+            "estimated_train_flops_before": estimated_flops_before
+            if estimated_flops_available
+            else None,
+            "estimated_train_flops_after": estimated_flops_after
+            if estimated_flops_available
+            else None,
+            "estimated_train_flops_ratio": (
+                estimated_flops_after / estimated_flops_before
+                if estimated_flops_available and estimated_flops_before > 0
+                else None
+            ),
+        }
+
+
     @torch.no_grad()
     def generate_flow_action(
         self,
@@ -2058,6 +2337,7 @@ class Qwen2_5_VLMoEForAction(
         unnorm: Optional[bool] = True,
         # PERF PROFILING ADDED: opt-in CUDA Event timing switches.
         profile_timing: Optional[bool] = False,
+        profile_complexity: Optional[bool] = False,
         print_timing: Optional[bool] = False,
         **kwargs,
     ):
@@ -2248,6 +2528,26 @@ class Qwen2_5_VLMoEForAction(
         inputs_embeds[flow_action_mask] = action_embed
 
         perf_timer.stop("action_initialization")
+
+        should_profile_complexity = profile_timing or profile_complexity or any(
+            complexity_kwargs is not None
+            for complexity_kwargs in (
+                kwargs.get("vision_tokens_after"),
+                kwargs.get("vision_token_count_after"),
+                kwargs.get("pruned_vision_token_count"),
+                kwargs.get("vision_keep_ratio"),
+                kwargs.get("vispruner_keep_ratio"),
+                kwargs.get("vision_token_mask_after"),
+                kwargs.get("pruned_vision_token_mask"),
+                kwargs.get("vision_keep_mask"),
+            )
+        )
+        if should_profile_complexity:
+            self._log_complexity_track(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
 
         # PERF PROFILING ADDED: measure the full-prefix transformer prefill.
         perf_timer.start("prefetch_forward")
