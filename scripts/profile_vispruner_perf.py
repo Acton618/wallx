@@ -101,22 +101,60 @@ def make_batch(model, image_path: str, device: str, action_dim: int, pred_horizo
     )
 
 
-def cuda_time_call(fn, device: str) -> float:
-    if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        fn()
-        end.record()
-        torch.cuda.synchronize()
-        return float(start.elapsed_time(end))
+def average_timing_dict(timing_dicts):
+    keys = sorted({key for item in timing_dicts for key in item})
+    return {
+        key: sum(item.get(key, 0.0) for item in timing_dicts) / len(timing_dicts)
+        for key in keys
+    }
 
-    import time
 
-    start = time.perf_counter()
-    fn()
-    return (time.perf_counter() - start) * 1000.0
+def print_timing_breakdown(case_name: str, averages: dict, last: dict):
+    print(f"[VISPRUNER_TIMING] ===== {case_name} average breakdown =====", flush=True)
+    for key in sorted(averages):
+        print(
+            f"[VISPRUNER_TIMING] {case_name}.{key}.avg_ms={averages[key]:.3f}",
+            flush=True,
+        )
+    print(f"[VISPRUNER_TIMING] ===== {case_name} last breakdown =====", flush=True)
+    for key in sorted(last):
+        print(
+            f"[VISPRUNER_TIMING] {case_name}.{key}.last_ms={last[key]:.3f}",
+            flush=True,
+        )
+
+
+def print_timing_comparison(baseline: dict, pruned: dict):
+    if not baseline or not pruned:
+        return
+    print("\n[VISPRUNER_COMPARE] ===== segmented timing comparison =====", flush=True)
+    print(
+        "[VISPRUNER_COMPARE] segment | baseline_avg_ms | pruned_avg_ms | delta_ms | delta_pct",
+        flush=True,
+    )
+    preferred_order = [
+        "total_time",
+        "embed_processing",
+        "vision_image_forward",
+        "vision_video_forward",
+        "position_encoding",
+        "action_initialization",
+        "prefetch_forward",
+        "cache_preprocessing",
+        "ode_integration",
+        "postprocessing",
+    ]
+    keys = [key for key in preferred_order if key in baseline or key in pruned]
+    keys.extend(sorted((set(baseline) | set(pruned)) - set(keys)))
+    for key in keys:
+        base = baseline.get(key, 0.0)
+        prun = pruned.get(key, 0.0)
+        delta = prun - base
+        pct = (delta / base * 100.0) if base else 0.0
+        print(
+            f"[VISPRUNER_COMPARE] {key} | {base:.3f} | {prun:.3f} | {delta:+.3f} | {pct:+.2f}%",
+            flush=True,
+        )
 
 
 def run_case(args, case_name: str, enable_pruning: bool):
@@ -189,25 +227,28 @@ def run_case(args, case_name: str, enable_pruning: bool):
         for _ in range(args.warmup):
             _ = model(**call_kwargs, profile_timing=False, print_timing=False)
 
-        timings = []
+        timing_dicts = []
         for _ in range(args.iters):
-            elapsed_ms = cuda_time_call(
-                lambda: model(**call_kwargs, profile_timing=False, print_timing=False),
-                args.device,
-            )
-            timings.append(elapsed_ms)
+            out = model(**call_kwargs, profile_timing=True, print_timing=False)
+            timing_dicts.append(dict(out["timing_results_ms"]))
 
-    avg_ms = sum(timings) / len(timings)
-    print(f"[VISPRUNER_PROFILE] last_total_time_ms={timings[-1]:.3f}", flush=True)
+    avg_timing = average_timing_dict(timing_dicts)
+    last_timing = timing_dicts[-1]
     print(
-        f"[VISPRUNER_PROFILE] average_total_time_ms={avg_ms:.3f} over {args.iters} runs",
+        f"[VISPRUNER_PROFILE] last_total_time_ms={last_timing.get('total_time', 0.0):.3f}",
         flush=True,
     )
+    print(
+        f"[VISPRUNER_PROFILE] average_total_time_ms={avg_timing.get('total_time', 0.0):.3f} over {args.iters} runs",
+        flush=True,
+    )
+    print_timing_breakdown(case_name, avg_timing, last_timing)
 
     del model
     gc.collect()
     if args.device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.empty_cache()
+    return avg_timing
 
 
 def main():
@@ -238,10 +279,13 @@ def main():
     print(f"[VISPRUNER_PROFILE] iters={args.iters}", flush=True)
     print(f"[VISPRUNER_PROFILE] keep_ratio={args.keep_ratio}", flush=True)
 
+    baseline_timing = None
+    pruned_timing = None
     if args.case in ("baseline", "both"):
-        run_case(args, "baseline_no_pruning", enable_pruning=False)
+        baseline_timing = run_case(args, "baseline_no_pruning", enable_pruning=False)
     if args.case in ("pruned", "both"):
-        run_case(args, "vispruner_pruned", enable_pruning=True)
+        pruned_timing = run_case(args, "vispruner_pruned", enable_pruning=True)
+    print_timing_comparison(baseline_timing, pruned_timing)
 
 
 if __name__ == "__main__":

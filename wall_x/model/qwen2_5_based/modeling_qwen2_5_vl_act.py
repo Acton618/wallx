@@ -2708,7 +2708,7 @@ class Qwen2_5_VLMoEForAction(
 
         perf_timer.stop("action_initialization")
 
-        should_profile_complexity = profile_timing or profile_complexity or any(
+        should_profile_complexity = profile_complexity or any(
             complexity_kwargs is not None
             for complexity_kwargs in (
                 kwargs.get("vision_tokens_after"),
