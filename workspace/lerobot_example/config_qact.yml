@@ -32,6 +32,14 @@ epoch_save_interval: 10
 FSDP2: True
 torch_compile: False
 
+# Visual token pruning. Defaults keep the original Wall-X image path.
+vispruner:
+  enable: false
+  strategy: original
+  keep_ratio: 1.0
+  min_tokens: 1
+  force_vision_eager: true
+
 # Robot configuration - Define degrees of freedom for each component
 dof_config:
   follow_left_ee_cartesian_pos: 3      # Left end-effector Cartesian position

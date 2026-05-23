@@ -574,7 +574,13 @@ class InferConfig:
         self.model_config = update_model_config(self.train_config, self.model_config)
 
         self.model_config._attn_implementation = "sdpa"
-        self.model_config.vision_config._attn_implementation = "flash_attention_2"
+        if not (
+            getattr(self.model_config, "vispruner_enable", False)
+            and getattr(self.model_config, "vispruner_strategy", "original")
+            != "original"
+            and getattr(self.model_config, "vispruner_force_vision_eager", True)
+        ):
+            self.model_config.vision_config._attn_implementation = "flash_attention_2"
 
         print("[LoadModelConfig] Model config loaded and updated successfully.")
 

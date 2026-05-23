@@ -224,6 +224,7 @@ class Qwen2_5_VLVisionFlashAttention2(nn.Module):
         max_seqlen: Optional[int] = None,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        output_attentions: bool = False,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         q, k, v = (
@@ -254,6 +255,8 @@ class Qwen2_5_VLVisionFlashAttention2(nn.Module):
             q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
         ).reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
+        if output_attentions:
+            return attn_output, None
         return attn_output
 
 
@@ -293,6 +296,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         max_seqlen: Optional[int] = None,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        output_attentions: bool = False,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         q, k, v = (
@@ -340,6 +344,8 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
+        if output_attentions:
+            return attn_output, attn_weights
         return attn_output
 
 
@@ -357,6 +363,7 @@ class Qwen2_5_VLVisionSdpaAttention(nn.Module):
         max_seqlen: Optional[int] = None,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        output_attentions: bool = False,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         q, k, v = (
@@ -397,6 +404,8 @@ class Qwen2_5_VLVisionSdpaAttention(nn.Module):
         attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
+        if output_attentions:
+            return attn_output, None
         return attn_output
 
 
@@ -424,15 +433,25 @@ class Qwen2_5_VLVisionBlock(nn.Module):
         max_seqlen: Optional[int] = None,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        output_attentions: bool = False,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
+        attn_outputs = self.attn(
             self.norm1(hidden_states)[0],
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
+            output_attentions=output_attentions,
         )
+        if output_attentions:
+            attn_output, attn_weights = attn_outputs
+        else:
+            attn_output, attn_weights = attn_outputs, None
+
+        hidden_states = hidden_states + attn_output
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states)[0])
+        if output_attentions:
+            return hidden_states, attn_weights
         return hidden_states
 
 
@@ -592,7 +611,10 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         return window_index, cu_window_seqlens
 
     def forward(
-        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        grid_thw: torch.Tensor,
+        output_attentions: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -647,6 +669,8 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
             (cu_window_seqlens[1:] - cu_window_seqlens[:-1]).max().item()
         )
 
+        patch_score_sum = None
+        patch_score_count = 0
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
@@ -654,7 +678,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
             else:
                 cu_seqlens_now = cu_window_seqlens
                 max_seqlen_now = max_seqlen_window
-            if self.gradient_checkpointing and self.training:
+            if self.gradient_checkpointing and self.training and not output_attentions:
                 hidden_states = self._gradient_checkpointing_func(
                     blk.__call__,
                     hidden_states,
@@ -663,17 +687,40 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
                     position_embeddings,
                 )
             else:
-                hidden_states = blk(
+                block_outputs = blk(
                     hidden_states,
                     cu_seqlens=cu_seqlens_now,
                     max_seqlen=max_seqlen_now,
                     position_embeddings=position_embeddings,
+                    output_attentions=output_attentions,
                 )
+                if output_attentions:
+                    hidden_states, attn_weights = block_outputs
+                    if attn_weights is not None:
+                        patch_scores = attn_weights.detach().float().mean(dim=0).mean(dim=0)
+                        if patch_score_sum is None:
+                            patch_score_sum = patch_scores
+                        else:
+                            patch_score_sum = patch_score_sum + patch_scores
+                        patch_score_count += 1
+                else:
+                    hidden_states = block_outputs
+
+        merged_scores = None
+        if output_attentions and patch_score_sum is not None and patch_score_count > 0:
+            patch_scores = patch_score_sum / patch_score_count
+            merged_scores = patch_scores.reshape(
+                seq_len // self.spatial_merge_unit, self.spatial_merge_unit
+            ).mean(dim=1)
 
         hidden_states = self.merger(hidden_states)
         reverse_indices = torch.argsort(window_index)
         hidden_states = hidden_states[reverse_indices, :]
+        if merged_scores is not None:
+            merged_scores = merged_scores[reverse_indices]
 
+        if output_attentions:
+            return hidden_states, merged_scores
         return hidden_states
 
 

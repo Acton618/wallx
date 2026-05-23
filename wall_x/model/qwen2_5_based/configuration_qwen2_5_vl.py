@@ -213,6 +213,11 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         causal_action_attention_mask=False,
         use_x_pred=False,
         attn_deterministic=False,
+        vispruner_enable=False,
+        vispruner_strategy="original",
+        vispruner_keep_ratio=1.0,
+        vispruner_min_tokens=1,
+        vispruner_force_vision_eager=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -260,6 +265,11 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         self.causal_action_attention_mask = causal_action_attention_mask
         self.use_x_pred = use_x_pred
         self.attn_deterministic = attn_deterministic
+        self.vispruner_enable = vispruner_enable
+        self.vispruner_strategy = vispruner_strategy
+        self.vispruner_keep_ratio = vispruner_keep_ratio
+        self.vispruner_min_tokens = vispruner_min_tokens
+        self.vispruner_force_vision_eager = vispruner_force_vision_eager
 
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.

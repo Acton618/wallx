@@ -36,6 +36,7 @@ from transformers.modeling_outputs import (
 
 from wall_x.fusions import ops
 from wall_x.model.action_head import ActionProcessor
+from wall_x.model.vispruner_token_pruner import WallXVisPruner
 from wall_x.model.qwen2_5_based.configuration_qwen2_5_vl import Qwen2_5_VLConfig
 from wall_x.model.model_utils import (
     load_wallx_processors,
@@ -1016,6 +1017,12 @@ class Qwen2_5_VLMoEForAction(
             action_mapper: Action mapping utility
             flow_loss_weight (float): Weight for flow loss computation
         """
+        if (
+            getattr(config, "vispruner_enable", False)
+            and getattr(config, "vispruner_strategy", "original") != "original"
+            and getattr(config, "vispruner_force_vision_eager", True)
+        ):
+            config.vision_config._attn_implementation = "eager"
         super().__init__(config)
 
         # Initialize vision transformer and language model components
@@ -1030,6 +1037,7 @@ class Qwen2_5_VLMoEForAction(
 
         # Initialize loss function without reduction for channel-wise loss computation
         self.loss_fct = CrossEntropyLoss(reduction="none")
+        self.vispruner = WallXVisPruner(config)
         self.flow_loss_weight = flow_loss_weight
         self.use_fast_tokenizer = use_fast_tokenizer
         self.processor = processor
@@ -1132,6 +1140,126 @@ class Qwen2_5_VLMoEForAction(
     def get_decoder(self):
         """Get the decoder model."""
         return self.model
+
+    def _should_prune_images(self, pixel_values, image_grid_thw) -> bool:
+        return (
+            pixel_values is not None
+            and image_grid_thw is not None
+            and self.vispruner.enabled
+        )
+
+    def _pad_token_id(self) -> int:
+        if self.config.pad_token_id is not None:
+            return self.config.pad_token_id
+        if (
+            self.processor is not None
+            and getattr(self.processor, "tokenizer", None) is not None
+        ):
+            return self.processor.tokenizer.pad_token_id
+        return 0
+
+    def _ensure_position_ids_for_pruning(
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        image_grid_thw,
+        video_grid_thw,
+        second_per_grid_ts,
+    ):
+        if position_ids is not None:
+            return position_ids
+        if input_ids is None:
+            return None
+        if attention_mask is not None and attention_mask.ndim != 2:
+            return None
+
+        position_ids, rope_deltas = self.get_rope_index(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
+            attention_mask=attention_mask,
+        )
+        self.rope_deltas = rope_deltas
+        return position_ids
+
+    def _encode_images_and_maybe_prune(
+        self,
+        pixel_values,
+        image_grid_thw,
+        input_ids,
+        attention_mask=None,
+        labels=None,
+        moe_token_types=None,
+        position_ids=None,
+        video_grid_thw=None,
+        second_per_grid_ts=None,
+    ):
+        pixel_values = pixel_values.type(self.visual.dtype)
+
+        if self._should_prune_images(pixel_values, image_grid_thw):
+            image_embeds, image_scores = self.visual(
+                pixel_values, grid_thw=image_grid_thw, output_attentions=True
+            )
+            position_ids = self._ensure_position_ids_for_pruning(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+            )
+            prune_result = self.vispruner(
+                image_embeds=image_embeds,
+                image_scores=image_scores,
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                image_token_id=self.config.image_token_id,
+                spatial_merge_size=self.config.vision_config.spatial_merge_size,
+                attention_mask=attention_mask,
+                labels=labels,
+                moe_token_types=moe_token_types,
+                position_ids=position_ids,
+                pad_token_id=self._pad_token_id(),
+            )
+            if prune_result.rope_deltas is not None:
+                self.rope_deltas = prune_result.rope_deltas
+            return (
+                prune_result.image_embeds,
+                prune_result.input_ids,
+                prune_result.attention_mask,
+                prune_result.labels,
+                prune_result.moe_token_types,
+                prune_result.position_ids,
+                prune_result.pruned,
+            )
+
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        return (
+            image_embeds,
+            input_ids,
+            attention_mask,
+            labels,
+            moe_token_types,
+            position_ids,
+            False,
+        )
+
+    def _scatter_image_embeds(self, inputs_embeds, input_ids, image_embeds):
+        n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
+        n_image_features = image_embeds.shape[0]
+        if n_image_tokens != n_image_features:
+            raise ValueError(
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+            )
+
+        mask = input_ids == self.config.image_token_id
+        mask_unsqueezed = mask.unsqueeze(-1)
+        mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
+        image_mask = mask_expanded.to(inputs_embeds.device)
+        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        return inputs_embeds.masked_scatter(image_mask, image_embeds)
 
     def get_rope_index(
         self,
@@ -1449,19 +1577,37 @@ class Qwen2_5_VLMoEForAction(
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
         if inputs_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            image_embeds = None
+            image_pruned = False
             if pixel_values is not None:
-                pixel_values = pixel_values.type(self.visual.dtype)
-                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-                mask = input_ids == self.config.image_token_id
-                mask_unsqueezed = mask.unsqueeze(-1)
-                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-                image_mask = mask_expanded.to(inputs_embeds.device)
-
-                image_embeds = image_embeds.to(
-                    inputs_embeds.device, inputs_embeds.dtype
+                (
+                    image_embeds,
+                    input_ids,
+                    attention_mask,
+                    labels,
+                    moe_token_types,
+                    position_ids,
+                    image_pruned,
+                ) = self._encode_images_and_maybe_prune(
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    moe_token_types=moe_token_types,
+                    position_ids=position_ids,
+                    video_grid_thw=video_grid_thw,
+                    second_per_grid_ts=second_per_grid_ts,
                 )
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                if image_pruned:
+                    start_indices, end_indices = None, None
+                    batch_size, seq_length = input_ids.shape
+
+            inputs_embeds = self.model.embed_tokens(input_ids)
+            if image_embeds is not None:
+                inputs_embeds = self._scatter_image_embeds(
+                    inputs_embeds, input_ids, image_embeds
+                )
 
             if pixel_values_videos is not None:
                 pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
@@ -1493,6 +1639,16 @@ class Qwen2_5_VLMoEForAction(
 
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
+
+        if start_indices is None or end_indices is None:
+            group_size = torch.zeros(
+                self.config.num_experts, dtype=torch.long, device="cpu"
+            )
+            for i in range(self.config.num_experts):
+                group_size[i] = (moe_token_types == i).sum()
+
+            start_indices = torch.cumsum(group_size, dim=0) - group_size
+            end_indices = torch.cumsum(group_size, dim=0)
 
         outputs = self.model(
             input_ids=None,
@@ -1674,32 +1830,37 @@ class Qwen2_5_VLMoEForAction(
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
+        image_pruned = False
+
         # Process input embeddings with multi-modal data
         if inputs_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
-
-            # Process image embeddings
+            image_embeds = None
             if pixel_values is not None:
-                pixel_values = pixel_values.type(self.visual.dtype)
-                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-                n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
-                n_image_features = image_embeds.shape[0]
-
-                # Validate image token and feature count match
-                if n_image_tokens != n_image_features:
-                    raise ValueError(
-                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-                    )
-
-                mask = input_ids == self.config.image_token_id
-                mask_unsqueezed = mask.unsqueeze(-1)
-                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-                image_mask = mask_expanded.to(inputs_embeds.device)
-
-                image_embeds = image_embeds.to(
-                    inputs_embeds.device, inputs_embeds.dtype
+                (
+                    image_embeds,
+                    input_ids,
+                    attention_mask,
+                    labels,
+                    moe_token_types,
+                    position_ids,
+                    image_pruned,
+                ) = self._encode_images_and_maybe_prune(
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    moe_token_types=moe_token_types,
+                    position_ids=position_ids,
+                    video_grid_thw=video_grid_thw,
+                    second_per_grid_ts=second_per_grid_ts,
                 )
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+            inputs_embeds = self.model.embed_tokens(input_ids)
+            if image_embeds is not None:
+                inputs_embeds = self._scatter_image_embeds(
+                    inputs_embeds, input_ids, image_embeds
+                )
 
             # Process video embeddings
             if pixel_values_videos is not None:
@@ -1812,6 +1973,11 @@ class Qwen2_5_VLMoEForAction(
                 inputs_embeds = inputs_embeds[:, : split_pos + 3, :]
                 if attention_mask is not None:
                     attention_mask = attention_mask[:, : split_pos + 3]
+                if position_ids is not None:
+                    if position_ids.dim() == 3:
+                        position_ids = position_ids[:, :, : split_pos + 3]
+                    else:
+                        position_ids = position_ids[:, : split_pos + 3]
                 if labels is not None:
                     labels = labels[:, split_pos + 3 :]
             else:
@@ -1832,9 +1998,11 @@ class Qwen2_5_VLMoEForAction(
             batch = {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
-                "pixel_values": pixel_values,
+                "inputs_embeds": inputs_embeds if image_pruned else None,
+                "pixel_values": None if image_pruned else pixel_values,
                 "moe_token_types": moe_token_types,
-                "image_grid_thw": image_grid_thw,
+                "position_ids": position_ids if image_pruned else None,
+                "image_grid_thw": None if image_pruned else image_grid_thw,
                 "dof_mask": dof_mask,
                 "agent_pos_mask": agent_pos_mask,
                 "proprioception": proprioception,
@@ -2370,29 +2538,40 @@ class Qwen2_5_VLMoEForAction(
         # PERF PROFILING ADDED: measure embedding plus multimodal input preparation.
         perf_timer.start("embed_processing")
         if inputs_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            image_embeds = None
+            image_pruned = False
             if pixel_values is not None:
-                pixel_values = pixel_values.type(self.visual.dtype)
                 # PERF PROFILING ADDED: isolate image vision tower latency.
                 perf_timer.start("vision_image_forward")
-                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-                perf_timer.stop("vision_image_forward")
-                n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
-                n_image_features = image_embeds.shape[0]
-                if n_image_tokens != n_image_features:
-                    raise ValueError(
-                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-                    )
-
-                mask = input_ids == self.config.image_token_id
-                mask_unsqueezed = mask.unsqueeze(-1)
-                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-                image_mask = mask_expanded.to(inputs_embeds.device)
-
-                image_embeds = image_embeds.to(
-                    inputs_embeds.device, inputs_embeds.dtype
+                (
+                    image_embeds,
+                    input_ids,
+                    attention_mask,
+                    labels,
+                    moe_token_types,
+                    position_ids,
+                    image_pruned,
+                ) = self._encode_images_and_maybe_prune(
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    moe_token_types=moe_token_types,
+                    position_ids=position_ids,
+                    video_grid_thw=video_grid_thw,
+                    second_per_grid_ts=second_per_grid_ts,
                 )
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                perf_timer.stop("vision_image_forward")
+                if image_pruned:
+                    start_indices, end_indices = None, None
+                    prefix_length = None
+
+            inputs_embeds = self.model.embed_tokens(input_ids)
+            if image_embeds is not None:
+                inputs_embeds = self._scatter_image_embeds(
+                    inputs_embeds, input_ids, image_embeds
+                )
 
             if pixel_values_videos is not None:
                 pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
