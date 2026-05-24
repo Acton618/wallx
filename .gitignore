@@ -212,6 +212,8 @@ ray/auth.json
 # AI/ML related
 *.ai
 datasheet/
+3rdparty/lerobot/
+3rdparty/lerobot.zip
 
 # =============================================================================
 # LOGGING AND MONITORING
