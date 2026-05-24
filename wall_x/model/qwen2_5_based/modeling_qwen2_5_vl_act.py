@@ -70,6 +70,7 @@ class _InferencePerfTimer:
     def __init__(self, enabled: bool, device: Optional[torch.device] = None):
         self.enabled = enabled
         self.timings_ms = {}
+        self.counts = {}
         self._starts = {}
         self.device = torch.device(device) if device is not None else None
         self.use_cuda = (
@@ -104,7 +105,8 @@ class _InferencePerfTimer:
             elapsed_ms = start_event.elapsed_time(end_event)
         else:
             elapsed_ms = (time.perf_counter() - start) * 1000.0
-        self.timings_ms[name] = elapsed_ms
+        self.timings_ms[name] = self.timings_ms.get(name, 0.0) + elapsed_ms
+        self.counts[name] = self.counts.get(name, 0) + 1
         return elapsed_ms
 
     def seconds(self):
@@ -1195,13 +1197,24 @@ class Qwen2_5_VLMoEForAction(
         position_ids=None,
         video_grid_thw=None,
         second_per_grid_ts=None,
+        perf_timer=None,
     ):
+        if perf_timer is not None:
+            perf_timer.start("image_path_total")
+            perf_timer.start("image_cast")
         pixel_values = pixel_values.type(self.visual.dtype)
+        if perf_timer is not None:
+            perf_timer.stop("image_cast")
 
         if self._should_prune_images(pixel_values, image_grid_thw):
+            if perf_timer is not None:
+                perf_timer.start("vision_image_encode_score")
             image_embeds, image_scores = self.visual(
                 pixel_values, grid_thw=image_grid_thw, output_attentions=True
             )
+            if perf_timer is not None:
+                perf_timer.stop("vision_image_encode_score")
+                perf_timer.start("pruning_position_ids_prepare")
             position_ids = self._ensure_position_ids_for_pruning(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -1210,6 +1223,8 @@ class Qwen2_5_VLMoEForAction(
                 video_grid_thw=video_grid_thw,
                 second_per_grid_ts=second_per_grid_ts,
             )
+            if perf_timer is not None:
+                perf_timer.stop("pruning_position_ids_prepare")
             prune_result = self.vispruner(
                 image_embeds=image_embeds,
                 image_scores=image_scores,
@@ -1222,9 +1237,12 @@ class Qwen2_5_VLMoEForAction(
                 moe_token_types=moe_token_types,
                 position_ids=position_ids,
                 pad_token_id=self._pad_token_id(),
+                perf_timer=perf_timer,
             )
             if prune_result.rope_deltas is not None:
                 self.rope_deltas = prune_result.rope_deltas
+            if perf_timer is not None:
+                perf_timer.stop("image_path_total")
             return (
                 prune_result.image_embeds,
                 prune_result.input_ids,
@@ -1235,7 +1253,12 @@ class Qwen2_5_VLMoEForAction(
                 prune_result.pruned,
             )
 
+        if perf_timer is not None:
+            perf_timer.start("vision_image_encode")
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if perf_timer is not None:
+            perf_timer.stop("vision_image_encode")
+            perf_timer.stop("image_path_total")
         return (
             image_embeds,
             input_ids,
@@ -2561,17 +2584,22 @@ class Qwen2_5_VLMoEForAction(
                     position_ids=position_ids,
                     video_grid_thw=video_grid_thw,
                     second_per_grid_ts=second_per_grid_ts,
+                    perf_timer=perf_timer,
                 )
                 perf_timer.stop("vision_image_forward")
                 if image_pruned:
                     start_indices, end_indices = None, None
                     prefix_length = None
 
+            perf_timer.start("embed_tokens")
             inputs_embeds = self.model.embed_tokens(input_ids)
+            perf_timer.stop("embed_tokens")
             if image_embeds is not None:
+                perf_timer.start("scatter_image_embeds")
                 inputs_embeds = self._scatter_image_embeds(
                     inputs_embeds, input_ids, image_embeds
                 )
+                perf_timer.stop("scatter_image_embeds")
 
             if pixel_values_videos is not None:
                 pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
@@ -2594,12 +2622,15 @@ class Qwen2_5_VLMoEForAction(
                 video_embeds = video_embeds.to(
                     inputs_embeds.device, inputs_embeds.dtype
                 )
+                perf_timer.start("scatter_video_embeds")
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+                perf_timer.stop("scatter_video_embeds")
 
             if (
                 proprioception is not None
                 and not self.config.use_state_string_representation
             ):
+                perf_timer.start("scatter_proprioception")
                 proprioception = proprioception.to(inputs_embeds.device)
                 agent_pos_mask = agent_pos_mask.to(inputs_embeds.device)
                 proprio_embed = self.action_preprocessor.proprioception_proj(
@@ -2614,9 +2645,12 @@ class Qwen2_5_VLMoEForAction(
                 inputs_embeds[proprioception_mask] = proprio_embed.reshape(
                     -1, inputs_embeds.shape[-1]
                 ).to(inputs_embeds.dtype)
+                perf_timer.stop("scatter_proprioception")
 
             if attention_mask is not None:
+                perf_timer.start("attention_mask_to_device")
                 attention_mask = attention_mask.to(inputs_embeds.device)
+                perf_timer.stop("attention_mask_to_device")
 
         perf_timer.stop("embed_processing")
 
@@ -2632,6 +2666,7 @@ class Qwen2_5_VLMoEForAction(
                 or self.rope_deltas is None
                 or (past_key_values is None or past_key_values.get_seq_length() == 0)
             ):
+                perf_timer.start("position_ids_rope")
                 position_ids, rope_deltas = self.get_rope_index(
                     input_ids,
                     image_grid_thw,
@@ -2640,8 +2675,10 @@ class Qwen2_5_VLMoEForAction(
                     attention_mask,
                 )
                 self.rope_deltas = rope_deltas
+                perf_timer.stop("position_ids_rope")
             # then use the prev pre-calculated rope-deltas to get the correct position ids
             else:
+                perf_timer.start("position_ids_from_cache")
                 batch_size, seq_length, _ = inputs_embeds.shape
                 delta = (
                     (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
@@ -2654,9 +2691,11 @@ class Qwen2_5_VLMoEForAction(
                     delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+                perf_timer.stop("position_ids_from_cache")
 
         if start_indices is None or end_indices is None:
             # Calculate the start and end positions of each expert group's tokens after permutation (the dataset does not contain `num_expert` information, so this calculation must be done here).
+            perf_timer.start("moe_indices")
             group_size = torch.zeros(
                 self.config.num_experts, dtype=torch.long, device="cpu"
             )
@@ -2666,17 +2705,21 @@ class Qwen2_5_VLMoEForAction(
             # Calculate start and end indices for each expert group
             start_indices = torch.cumsum(group_size, dim=0) - group_size
             end_indices = torch.cumsum(group_size, dim=0)
+            perf_timer.stop("moe_indices")
 
         perf_timer.stop("position_encoding")
 
         # PERF PROFILING ADDED: measure diffusion action initialization.
         perf_timer.start("action_initialization")
         if action_chunk is not None:
+            perf_timer.start("action_chunk_to_device")
             action_chunk = action_chunk.to(inputs_embeds.device).to(torch.float32)
+            perf_timer.stop("action_chunk_to_device")
 
         output = {}
         # Reproduce
         # torch.manual_seed(0)
+        perf_timer.start("action_init_noise")
         noise = torch.randn(
             size=(batch_size, action_horizon, action_dim),
             dtype=torch.float32,
@@ -2695,16 +2738,21 @@ class Qwen2_5_VLMoEForAction(
             )
         times = self.times_cache[num_inference_timesteps]
         dt = times[1] - times[0]
+        perf_timer.stop("action_init_noise")
         time_0 = times[0].unsqueeze(0).repeat(noisy_action.shape[0])
+        perf_timer.start("action_init_embed")
         action_embed, adarms_cond = self.action_preprocessor.step(
             timestep=time_0, noisy_action=noisy_action, dof_mask=dof_mask
         )
         action_embed = action_embed.reshape(-1, inputs_embeds.shape[-1]).to(
             inputs_embeds.dtype
         )
+        perf_timer.stop("action_init_embed")
+        perf_timer.start("scatter_action_init")
         flow_action_mask = input_ids == self.action_token_id_set["action_token_id"]
 
         inputs_embeds[flow_action_mask] = action_embed
+        perf_timer.stop("scatter_action_init")
 
         perf_timer.stop("action_initialization")
 
@@ -2730,6 +2778,7 @@ class Qwen2_5_VLMoEForAction(
 
         # PERF PROFILING ADDED: measure the full-prefix transformer prefill.
         perf_timer.start("prefetch_forward")
+        perf_timer.start("prefill_transformer")
         prefetch_output = self.model(
             input_ids=None,
             attention_mask=attention_mask,
@@ -2746,9 +2795,11 @@ class Qwen2_5_VLMoEForAction(
             return_dict=True,
             adarms_conds=[None, adarms_cond],
         )
+        perf_timer.stop("prefill_transformer")
         hidden_states = prefetch_output.last_hidden_state
         prefix_kv_cache = prefetch_output.past_key_values
 
+        perf_timer.start("prefill_action_head")
         action_hidden_states = hidden_states[flow_action_mask].to(torch.float32)
         action_pred = self.action_preprocessor.action_proj_back(
             action_hidden_states[:, : self.action_preprocessor.action_hidden_size]
@@ -2766,19 +2817,23 @@ class Qwen2_5_VLMoEForAction(
         noisy_action = noisy_action + dt * v_0.reshape(
             batch_size, action_horizon, action_dim
         )
+        perf_timer.stop("prefill_action_head")
 
         perf_timer.stop("prefetch_forward")
 
         # PERF PROFILING ADDED: measure KV-cache and postfix mask preparation.
         perf_timer.start("cache_preprocessing")
 
+        perf_timer.start("prefix_length_resolve")
         if prefix_length is None:
             has_true = flow_action_mask.any(dim=1)
             prefix_length = torch.argmax(flow_action_mask.float(), dim=1, keepdim=True)
             prefix_length[~has_true] = flow_action_mask.shape[1]
             prefix_length = prefix_length[0]
+        perf_timer.stop("prefix_length_resolve")
 
         # support different transformers version
+        perf_timer.start("kv_cache_trim")
         if hasattr(prefix_kv_cache, "key_cache"):
             for layer_i in range(len(prefix_kv_cache.key_cache)):
                 prefix_kv_cache.key_cache[layer_i] = prefix_kv_cache.key_cache[layer_i][
@@ -2795,13 +2850,17 @@ class Qwen2_5_VLMoEForAction(
                 prefix_kv_cache.layers[layer_i].values = prefix_kv_cache.layers[
                     layer_i
                 ].values[:, :, :prefix_length, :]
+        perf_timer.stop("kv_cache_trim")
 
+        perf_timer.start("postfix_slice")
         postfix_position_ids = position_ids[:, :, prefix_length:]
         postfix_inputs_embeds = inputs_embeds[:, prefix_length:, :]
         postfix_attention_mask = attention_mask[:, prefix_length:]
         postfix_moe_token_types = moe_token_types[:, prefix_length:]
         postfix_input_ids = input_ids[:, prefix_length:]
+        perf_timer.stop("postfix_slice")
 
+        perf_timer.start("postfix_moe_indices")
         group_size = torch.zeros(
             self.config.num_experts, dtype=torch.long, device="cpu"
         )
@@ -2811,7 +2870,9 @@ class Qwen2_5_VLMoEForAction(
         # Calculate start and end indices for each expert group
         postfix_start_indices = torch.cumsum(group_size, dim=0) - group_size
         postfix_end_indices = torch.cumsum(group_size, dim=0)
+        perf_timer.stop("postfix_moe_indices")
 
+        perf_timer.start("postfix_mask_build")
         pad_token_id = self.processor.tokenizer.pad_token_id
         padding_mask = input_ids == pad_token_id
 
@@ -2848,6 +2909,7 @@ class Qwen2_5_VLMoEForAction(
             )
             # Set the columns corresponding to the padding positions to False (the key position is the padding).
             _postfix_attention_mask[batch_idx, :, full_padding_mask[batch_idx]] = False
+        perf_timer.stop("postfix_mask_build")
 
         perf_timer.stop("cache_preprocessing")
 
@@ -2855,6 +2917,7 @@ class Qwen2_5_VLMoEForAction(
         perf_timer.start("ode_integration")
 
         def step_with_kvcache(timestep, noisy_action):
+            perf_timer.start("ode_action_embed_total")
             action_mask = (
                 postfix_input_ids == self.action_token_id_set["action_token_id"]
             )
@@ -2864,9 +2927,13 @@ class Qwen2_5_VLMoEForAction(
                 timestep=timestep, noisy_action=noisy_action, dof_mask=dof_mask
             )
             action_embed = action_embed.reshape(-1, postfix_inputs_embeds.shape[-1])
+            perf_timer.stop("ode_action_embed_total")
 
+            perf_timer.start("ode_prepare_inputs")
             temp_inputs_embeds = postfix_inputs_embeds.clone()
             temp_inputs_embeds[action_mask] = action_embed.to(temp_inputs_embeds.dtype)
+            perf_timer.stop("ode_prepare_inputs")
+            perf_timer.start("ode_transformer_total")
             transformer_outputs = self.model(
                 input_ids=None,
                 attention_mask=_postfix_attention_mask,
@@ -2882,7 +2949,9 @@ class Qwen2_5_VLMoEForAction(
                 return_dict=True,
                 adarms_conds=[None, adarms_cond],
             )
+            perf_timer.stop("ode_transformer_total")
 
+            perf_timer.start("ode_action_head_total")
             hidden_states = transformer_outputs.last_hidden_state
             action_hidden_states = hidden_states[action_mask].to(torch.float32)
             action_pred = self.action_preprocessor.action_proj_back(
@@ -2892,7 +2961,9 @@ class Qwen2_5_VLMoEForAction(
                 v_t = action_pred - noise.reshape(-1, noise.shape[-1])
             else:
                 v_t = action_pred
-            return v_t.reshape(batch_size, action_horizon, action_dim)
+            v_t = v_t.reshape(batch_size, action_horizon, action_dim)
+            perf_timer.stop("ode_action_head_total")
+            return v_t
 
         action_trajectory = odeint(
             step_with_kvcache, noisy_action, times[1:], method="euler"
@@ -2904,19 +2975,23 @@ class Qwen2_5_VLMoEForAction(
         perf_timer.start("postprocessing")
         predict_action = action_trajectory[-1]
         if unnorm:
+            perf_timer.start("postprocess_unnorm")
             predict_action = (
                 self.action_preprocessor.normalizer_action.unnormalize_data(
                     predict_action, dataset_names
                 )
             )
+            perf_timer.stop("postprocess_unnorm")
         output["predict_action"] = predict_action
         # normalize action chunk to get gt_action
         if action_chunk is not None:
+            perf_timer.start("postprocess_gt_action")
             output["gt_action"] = (
                 self.action_preprocessor.normalizer_action.unnormalize_data(
                     action_chunk, dataset_names
                 )
             )
+            perf_timer.stop("postprocess_gt_action")
 
         perf_timer.stop("postprocessing")
         perf_timer.stop("total_time")
@@ -2924,6 +2999,7 @@ class Qwen2_5_VLMoEForAction(
         # PERF PROFILING ADDED: expose timing results without changing prediction tensors.
         output["timing_results_ms"] = perf_timer.timings_ms
         output["timing_results"] = perf_timer.seconds()
+        output["timing_counts"] = perf_timer.counts
         if profile_timing and print_timing:
             for name, elapsed_ms in perf_timer.timings_ms.items():
                 print(f"[PERF] {name}: {elapsed_ms:.3f} ms", flush=True)

@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from typing import Dict, Any, List
 import torch
 import copy
@@ -109,6 +110,10 @@ class WallXPolicy(BasePolicy):
             f"Model loaded successfully. Device: {device}, Action dim: {action_dim}, Horizon: {pred_horizon}"
         )
 
+    def _sync_if_cuda(self) -> None:
+        if str(self.device).startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize(torch.device(self.device))
+
     @property
     def metadata(self) -> Dict[str, Any]:
         """Return metadata about the policy."""
@@ -141,6 +146,12 @@ class WallXPolicy(BasePolicy):
                 - Additional metadata
         """
         try:
+            timing_results_ms = {}
+            if self.profile_timing:
+                self._sync_if_cuda()
+                request_start = time.perf_counter()
+                prepare_start = time.perf_counter()
+
             # Need to predict new actions
             input_batch = prepare_batch(
                 obs,
@@ -158,8 +169,16 @@ class WallXPolicy(BasePolicy):
                 self.predict_mode,
                 self.device,
             )
+            if self.profile_timing:
+                self._sync_if_cuda()
+                timing_results_ms["external_prepare_batch"] = (
+                    time.perf_counter() - prepare_start
+                ) * 1000.0
 
             with torch.no_grad():
+                if self.profile_timing:
+                    self._sync_if_cuda()
+                    model_start = time.perf_counter()
                 outputs = self.model(
                     **input_batch,
                     action_dim=(
@@ -173,19 +192,42 @@ class WallXPolicy(BasePolicy):
                     profile_timing=self.profile_timing,
                     print_timing=self.profile_timing,
                 )
+                if self.profile_timing:
+                    self._sync_if_cuda()
+                    timing_results_ms["model_call_total"] = (
+                        time.perf_counter() - model_start
+                    ) * 1000.0
 
+            if self.profile_timing:
+                self._sync_if_cuda()
+                post_model_start = time.perf_counter()
             if outputs["predict_action"] is None:
                 predicted_actions = np.zeros(
                     [1, self.pred_horizon, self.action_dim]
                 ).astype(np.float32)
-
-            predicted_actions = (
-                outputs["predict_action"][:, :, : self.action_dim]
-                .detach()
-                .cpu()
-                .to(torch.float32)
-                .numpy()
-            )
+            else:
+                predicted_actions = (
+                    outputs["predict_action"][:, :, : self.action_dim]
+                    .detach()
+                    .cpu()
+                    .to(torch.float32)
+                    .numpy()
+                )
+            if self.profile_timing:
+                timing_results_ms["post_model_to_numpy"] = (
+                    time.perf_counter() - post_model_start
+                ) * 1000.0
+                timing_results_ms["request_total"] = (
+                    time.perf_counter() - request_start
+                ) * 1000.0
+                for name, elapsed_ms in timing_results_ms.items():
+                    logger.info("[PERF] %s: %.3f ms", name, elapsed_ms)
+                timing_results_ms.update(outputs.get("timing_results_ms", {}))
+                return {
+                    "predict_action": predicted_actions,
+                    "timing_results_ms": timing_results_ms,
+                    "timing_counts": outputs.get("timing_counts", {}),
+                }
             return {"predict_action": predicted_actions}
 
         except Exception as e:

@@ -1,6 +1,7 @@
 import argparse
 import gc
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,11 @@ _spec = importlib.util.spec_from_file_location("wallx_serving_policy_utils", _UT
 _utils = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_utils)
 prepare_batch = _utils.prepare_batch
+
+
+def sync_if_cuda(device: str):
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize(torch.device(device))
 
 
 class IdentityNormalizer:
@@ -186,12 +192,20 @@ def run_case(args, case_name: str, enable_pruning: bool):
         flush=True,
     )
 
+    sync_if_cuda(args.device)
+    prepare_start = time.perf_counter()
     batch = make_batch(
         model=model,
         image_path=args.image_path,
         device=args.device,
         action_dim=args.action_dim,
         pred_horizon=args.pred_horizon,
+    )
+    sync_if_cuda(args.device)
+    external_prepare_batch_ms = (time.perf_counter() - prepare_start) * 1000.0
+    print(
+        f"[VISPRUNER_TIMING] {case_name}.external_prepare_batch_ms={external_prepare_batch_ms:.3f}",
+        flush=True,
     )
     batch["labels"] = None
 
@@ -231,6 +245,7 @@ def run_case(args, case_name: str, enable_pruning: bool):
         for _ in range(args.iters):
             out = model(**call_kwargs, profile_timing=True, print_timing=False)
             timing_dicts.append(dict(out["timing_results_ms"]))
+        timing_counts = dict(out.get("timing_counts", {}))
 
     avg_timing = average_timing_dict(timing_dicts)
     last_timing = timing_dicts[-1]
@@ -243,6 +258,13 @@ def run_case(args, case_name: str, enable_pruning: bool):
         flush=True,
     )
     print_timing_breakdown(case_name, avg_timing, last_timing)
+    if timing_counts:
+        print(f"[VISPRUNER_TIMING] ===== {case_name} timing counts =====", flush=True)
+        for key in sorted(timing_counts):
+            print(
+                f"[VISPRUNER_TIMING] {case_name}.{key}.count={timing_counts[key]}",
+                flush=True,
+            )
 
     del model
     gc.collect()

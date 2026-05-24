@@ -98,6 +98,7 @@ class WallXVisPruner(nn.Module):
         image_embeds: torch.Tensor,
         image_scores: Optional[torch.Tensor],
         image_lengths: torch.LongTensor,
+        perf_timer=None,
     ) -> tuple[torch.Tensor, List[torch.Tensor]]:
         if self.strategy != "topk_attention":
             raise ValueError(
@@ -111,6 +112,8 @@ class WallXVisPruner(nn.Module):
                 f"Image grid token count ({total_tokens}) does not match image_embeds ({image_embeds.shape[0]})."
             )
 
+        if perf_timer is not None:
+            perf_timer.start("vispruner_score_prepare")
         if image_scores is None:
             scores = image_embeds.detach().float().norm(dim=-1)
         else:
@@ -120,12 +123,16 @@ class WallXVisPruner(nn.Module):
                     f"Image score count ({scores.shape[0]}) does not match image_embeds ({image_embeds.shape[0]})."
                 )
             scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+        if perf_timer is not None:
+            perf_timer.stop("vispruner_score_prepare")
 
         keep_mask = torch.zeros(
             image_embeds.shape[0], dtype=torch.bool, device=image_embeds.device
         )
         keep_indices: List[torch.Tensor] = []
         offset = 0
+        if perf_timer is not None:
+            perf_timer.start("vispruner_topk_select")
         for length_tensor in image_lengths:
             length = int(length_tensor.item())
             keep_count = int(torch.ceil(torch.tensor(length * self.keep_ratio)).item())
@@ -138,6 +145,8 @@ class WallXVisPruner(nn.Module):
             keep_mask[offset + local_keep] = True
             keep_indices.append(local_keep)
             offset += length
+        if perf_timer is not None:
+            perf_timer.stop("vispruner_topk_select")
 
         return keep_mask, keep_indices
 
@@ -155,6 +164,7 @@ class WallXVisPruner(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         pad_token_id: int = 0,
         label_ignore_index: int = -100,
+        perf_timer=None,
     ) -> VisualPruneResult:
         if not self.enabled:
             return VisualPruneResult(
@@ -172,14 +182,27 @@ class WallXVisPruner(nn.Module):
                 "WallXVisPruner only supports 2D attention_mask when hard-pruning image tokens."
             )
 
+        if perf_timer is not None:
+            perf_timer.start("vispruner_total")
+            perf_timer.start("vispruner_image_lengths")
         image_lengths = self._image_token_lengths(
             image_grid_thw, spatial_merge_size
         ).to(input_ids.device)
+        if perf_timer is not None:
+            perf_timer.stop("vispruner_image_lengths")
+            perf_timer.start("vispruner_build_keep_mask")
         image_keep_mask, keep_indices = self._build_image_keep_mask(
-            image_embeds, image_scores, image_lengths
+            image_embeds, image_scores, image_lengths, perf_timer=perf_timer
         )
+        if perf_timer is not None:
+            perf_timer.stop("vispruner_build_keep_mask")
+            perf_timer.start("vispruner_gather_image_embeds")
         pruned_image_embeds = image_embeds[image_keep_mask]
+        if perf_timer is not None:
+            perf_timer.stop("vispruner_gather_image_embeds")
 
+        if perf_timer is not None:
+            perf_timer.start("vispruner_apply_keep_to_sequences")
         new_input_ids = []
         new_attention_mask = [] if attention_mask is not None else None
         new_labels = [] if labels is not None else None
@@ -236,12 +259,16 @@ class WallXVisPruner(nn.Module):
                     new_position_ids.append(position_ids[:, batch_idx, seq_keep])
                 else:
                     new_position_ids.append(position_ids[batch_idx, seq_keep])
+        if perf_timer is not None:
+            perf_timer.stop("vispruner_apply_keep_to_sequences")
 
         if image_offset != image_embeds.shape[0] or grid_offset != image_lengths.shape[0]:
             raise ValueError(
                 "Unused image features remained after pruning; check batch/image ordering."
             )
 
+        if perf_timer is not None:
+            perf_timer.start("vispruner_pad_pruned_batch")
         pruned_input_ids = self._pad_1d(new_input_ids, pad_token_id)
         pruned_attention_mask = (
             self._pad_1d(new_attention_mask, 0)
@@ -263,9 +290,15 @@ class WallXVisPruner(nn.Module):
             if new_position_ids is not None
             else None
         )
+        if perf_timer is not None:
+            perf_timer.stop("vispruner_pad_pruned_batch")
+            perf_timer.start("vispruner_rope_deltas")
         rope_deltas = self._compute_rope_deltas(
             pruned_position_ids, pruned_attention_mask
         )
+        if perf_timer is not None:
+            perf_timer.stop("vispruner_rope_deltas")
+            perf_timer.stop("vispruner_total")
 
         return VisualPruneResult(
             image_embeds=pruned_image_embeds,

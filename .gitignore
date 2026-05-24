@@ -211,6 +211,7 @@ ray/auth.json
 
 # AI/ML related
 *.ai
+datasheet/
 
 # =============================================================================
 # LOGGING AND MONITORING
