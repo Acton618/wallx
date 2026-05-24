@@ -1,0 +1,158 @@
+<html><head><meta charset='utf-8'>
+<style>
+body{font-family:'Microsoft YaHei',Arial,sans-serif;line-height:1.55;color:#222;}
+h1,h2,h3{color:#111;} table{border-collapse:collapse;width:100%;margin:12px 0;}
+th,td{border:1px solid #888;padding:6px 8px;vertical-align:top;font-size:12px;}
+th{background:#eee;} .note{background:#fff7d6;padding:10px;border:1px solid #d8bf60;}
+.good{color:#096b2e;font-weight:bold}.bad{color:#9a1b1b;font-weight:bold}.mono{font-family:Consolas,monospace;}
+</style></head><body>
+<h1>Wall-X VisPruner 30 图时间戳对比中文说明报告</h1>
+<p>本报告根据 30 张图片的真实 baseline / VisPruner 剪枝版本运行结果重新整理，重点解释每个时间戳环节测量的含义，以及这些数据如何回答“视觉 token 减少但端到端加速很小”的问题。</p>
+<h2>1. 实验设置</h2>
+<table>
+<tr><th>项目</th><th>内容</th></tr>
+<tr><td>模型</td><td><span class='mono'>/root/autodl-tmp/wall_x/pretrained/wall-oss-fast</span></td></tr>
+<tr><td>图片目录</td><td><span class='mono'>/root/autodl-tmp/wall_x/benchmark_images/picsum_30</span></td></tr>
+<tr><td>图片来源</td><td>picsum.photos seed 图片，尺寸 640×480，用于多图压力测试而非机器人真实数据集。</td></tr>
+<tr><td>图片数量</td><td>30</td></tr>
+<tr><td>baseline</td><td>vispruner_enable=False，strategy=original，保留全部视觉 token。</td></tr>
+<tr><td>pruned</td><td>vispruner_enable=True，strategy=topk_attention，keep_ratio=0.5。</td></tr>
+<tr><td>warmup / iters</td><td>1 / 3。每张图每个版本先预热，再统计多次平均。</td></tr>
+<tr><td>计时方式</td><td>profile_timing=True，使用 CUDA Event；细粒度计时会引入同步开销，适合瓶颈诊断，不等同线上真实无 profiling 延迟。</td></tr>
+</table>
+<h2>2. 总体结论</h2>
+<table>
+<tr><th>指标</th><th>baseline</th><th>pruned</th><th>变化</th><th>解释</th></tr>
+<tr><td>平均视觉 token 数</td><td>63.00</td><td>32.00</td><td>-31.00（49.21%）</td><td>VisPruner 已真实生效，视觉 token 约减少一半。</td></tr>
+<tr><td>模型内部 total_time</td><td>346.291 ms</td><td>345.729 ms</td><td>-0.562 ms（-0.16%）</td><td>端到端动作生成几乎没有明显加速。</td></tr>
+</table>
+<p><b>核心判断：</b>当前 VisPruner 确实减少了视觉 token，但主要耗时集中在 ODE/postfix Transformer；同时剪枝发生在 vision tower 之后，仍需要完整视觉编码和 attention score 获取。因此 token 数下降没有显著转化为完整动作推理延迟下降。</p>
+<h2>3. 时间戳层级关系说明</h2>
+<p>这些时间戳存在嵌套关系，不能简单全部相加。最重要的层级如下：</p>
+<ul>
+<li><span class='mono'>total_time</span> 是模型内部总耗时。</li>
+<li><span class='mono'>embed_processing</span> 包含 <span class='mono'>image_path_total</span>、<span class='mono'>embed_tokens</span>、<span class='mono'>scatter_image_embeds</span> 等。</li>
+<li><span class='mono'>image_path_total</span> 在 baseline 中主要是 <span class='mono'>vision_image_encode</span>；在 pruned 中主要是 <span class='mono'>vision_image_encode_score</span> + <span class='mono'>pruning_position_ids_prepare</span> + <span class='mono'>vispruner_total</span>。</li>
+<li><span class='mono'>prefetch_forward</span> 包含 <span class='mono'>prefill_transformer</span> 和 <span class='mono'>prefill_action_head</span>。</li>
+<li><span class='mono'>ode_integration</span> 包含多次累计的 <span class='mono'>ode_action_embed_total</span>、<span class='mono'>ode_prepare_inputs</span>、<span class='mono'>ode_transformer_total</span>、<span class='mono'>ode_action_head_total</span>。</li>
+</ul>
+<h2>4. 各时间戳环节详细解释与前后对比</h2>
+<table>
+<tr><th>时间戳</th><th>测量环节</th><th>baseline 平均</th><th>pruned 平均</th><th>变化</th><th>数据意义与解释</th></tr>
+<tr><td><span class='mono'>external_prepare_batch_ms</span></td><td>模型外部输入准备</td><td>9.217 ms</td><td>9.396 ms</td><td>0.179 ms（1.94%）</td><td><b>模型外部输入准备</b><br>从原始图片、prompt、机器人状态构造模型 batch 的耗时，包括图像读取后的 processor 处理、tokenizer、状态归一化和张量搬运等。它不属于模型 forward 内部，但属于真实服务端端到端链路。<br><br><b>解释：</b>该段基本不受 VisPruner 影响；如果这里差异很大，通常是数据预处理波动，而不是剪枝算法收益。</td></tr>
+<tr><td><span class='mono'>total_time</span></td><td>模型内部完整动作生成</td><td>346.291 ms</td><td>345.729 ms</td><td>-0.562 ms（-0.16%）</td><td><b>模型内部完整动作生成</b><br>进入 generate_flow_action 后到输出动作张量前的总耗时，覆盖视觉编码/剪枝、embedding 拼接、位置编码、prefill、KV-cache 处理、ODE 多步动作生成和后处理。<br><br><b>解释：</b>这是判断完整 Wall-X 动作推理是否真正变快的核心指标。</td></tr>
+<tr><td><span class='mono'>embed_processing</span></td><td>多模态 embedding 准备总段</td><td>24.934 ms</td><td>25.135 ms</td><td>0.202 ms（0.81%）</td><td><b>多模态 embedding 准备总段</b><br>包含图像路径、token embedding、图像特征 scatter、视频特征处理、proprioception embedding 和 attention_mask 设备对齐。<br><br><b>解释：</b>该段内含 image_path_total，因此不能和 image_path_total 相加。它能反映剪枝前的视觉打分和序列裁剪是否增加了前处理成本。</td></tr>
+<tr><td><span class='mono'>image_path_total</span></td><td>图像路径总段</td><td>24.468 ms</td><td>24.711 ms</td><td>0.243 ms（0.99%）</td><td><b>图像路径总段</b><br>从 pixel_values dtype 转换开始，到图像视觉特征可用于 scatter 结束。baseline 是普通 vision encode；pruned 是 vision encode with output_attentions + position ids 准备 + VisPruner 裁剪。<br><br><b>解释：</b>如果 pruned 没有降低该段，说明当前剪枝发生在 vision tower 之后，不能节省视觉编码本身，还会增加打分/裁剪成本。</td></tr>
+<tr><td><span class='mono'>vision_image_forward</span></td><td>兼容旧命名的图像路径总段</td><td>24.497 ms</td><td>24.742 ms</td><td>0.245 ms（1.00%）</td><td><b>兼容旧命名的图像路径总段</b><br>包住 _encode_images_and_maybe_prune 的整体耗时，语义与 image_path_total 接近，用于兼容旧报告。<br><br><b>解释：</b>用于和旧 profiling 报告对齐；分析时优先看 image_path_total 及其子段。</td></tr>
+<tr><td><span class='mono'>image_cast</span></td><td>图像 dtype 转换</td><td>0.049 ms</td><td>0.050 ms</td><td>0.001 ms（1.06%）</td><td><b>图像 dtype 转换</b><br>将 pixel_values 转为 visual tower 使用的 dtype。<br><br><b>解释：</b>通常很小，不是瓶颈。</td></tr>
+<tr><td><span class='mono'>vision_image_encode</span></td><td>baseline 普通视觉编码</td><td>24.354 ms</td><td>0.000 ms</td><td>-24.354 ms（-100.00%）</td><td><b>baseline 普通视觉编码</b><br>关闭剪枝时调用 self.visual(pixel_values, grid_thw=image_grid_thw) 的耗时。<br><br><b>解释：</b>这是 baseline 图像塔成本。pruned 路径不会出现该 key，而是使用 vision_image_encode_score。</td></tr>
+<tr><td><span class='mono'>vision_image_encode_score</span></td><td>pruned 视觉编码与 attention score 获取</td><td>0.000 ms</td><td>22.966 ms</td><td>22.966 ms（仅 pruned 出现）</td><td><b>pruned 视觉编码与 attention score 获取</b><br>开启剪枝时调用 self.visual(..., output_attentions=True) 的耗时，用于得到 image_embeds 和 image_scores。<br><br><b>解释：</b>这是当前 topk_attention 策略最关键的额外成本。若它接近 baseline 的 vision_image_encode，则说明剪枝没有节省视觉塔，只是换成可输出 attention 的路径。</td></tr>
+<tr><td><span class='mono'>pruning_position_ids_prepare</span></td><td>剪枝前 position_ids 准备</td><td>0.000 ms</td><td>0.590 ms</td><td>0.590 ms（仅 pruned 出现）</td><td><b>剪枝前 position_ids 准备</b><br>为了同步裁剪 position_ids，必要时先计算原始序列的 RoPE position ids。<br><br><b>解释：</b>这是剪枝路径独有的额外成本。</td></tr>
+<tr><td><span class='mono'>vispruner_total</span></td><td>VisPruner 裁剪模块总段</td><td>0.000 ms</td><td>0.925 ms</td><td>0.925 ms（仅 pruned 出现）</td><td><b>VisPruner 裁剪模块总段</b><br>WallXVisPruner 内部完整耗时，包括长度计算、分数处理、top-k、裁剪 input_ids/attention_mask/moe_token_types/position_ids、padding 和 rope_deltas。<br><br><b>解释：</b>衡量剪枝操作本身是否昂贵。它不包含视觉塔 attention score 的获取。</td></tr>
+<tr><td><span class='mono'>vispruner_image_lengths</span></td><td>图像 token 长度计算</td><td>0.000 ms</td><td>0.069 ms</td><td>0.069 ms（仅 pruned 出现）</td><td><b>图像 token 长度计算</b><br>根据 image_grid_thw 和 spatial_merge_size 计算每张图对应的 LLM 视觉 token 数。<br><br><b>解释：</b>通常很小。</td></tr>
+<tr><td><span class='mono'>vispruner_build_keep_mask</span></td><td>构造保留 mask 总段</td><td>0.000 ms</td><td>0.262 ms</td><td>0.262 ms（仅 pruned 出现）</td><td><b>构造保留 mask 总段</b><br>包含 score_prepare 和 topk_select，输出每个视觉 token 是否保留的布尔 mask。<br><br><b>解释：</b>用于判断选择逻辑本身的开销。</td></tr>
+<tr><td><span class='mono'>vispruner_score_prepare</span></td><td>剪枝分数准备</td><td>0.000 ms</td><td>0.032 ms</td><td>0.032 ms（仅 pruned 出现）</td><td><b>剪枝分数准备</b><br>将 image_scores 拉平、detach、转 float，并处理 NaN/Inf；若没有 image_scores 则回退到 image_embeds norm。<br><br><b>解释：</b>通常不是主耗时。</td></tr>
+<tr><td><span class='mono'>vispruner_topk_select</span></td><td>逐图 top-k 选择</td><td>0.000 ms</td><td>0.149 ms</td><td>0.149 ms（仅 pruned 出现）</td><td><b>逐图 top-k 选择</b><br>按每张图的视觉 token 段，根据 keep_ratio 选择得分最高的 token，并保持原始顺序。<br><br><b>解释：</b>如果未来换更复杂的多样性/相似度算法，该段可能明显增加。</td></tr>
+<tr><td><span class='mono'>vispruner_gather_image_embeds</span></td><td>裁剪 image_embeds</td><td>0.000 ms</td><td>0.043 ms</td><td>0.043 ms（仅 pruned 出现）</td><td><b>裁剪 image_embeds</b><br>用 keep_mask 从 image_embeds 中取出保留的视觉特征。<br><br><b>解释：</b>通常较小。</td></tr>
+<tr><td><span class='mono'>vispruner_apply_keep_to_sequences</span></td><td>同步裁剪序列张量</td><td>0.000 ms</td><td>0.215 ms</td><td>0.215 ms（仅 pruned 出现）</td><td><b>同步裁剪序列张量</b><br>按视觉 token 保留结果，同步裁剪 input_ids、attention_mask、labels、moe_token_types、position_ids。<br><br><b>解释：</b>这是硬剪枝是否正确接入主模型的关键步骤。</td></tr>
+<tr><td><span class='mono'>vispruner_pad_pruned_batch</span></td><td>裁剪后 batch 重新 padding</td><td>0.000 ms</td><td>0.080 ms</td><td>0.080 ms（仅 pruned 出现）</td><td><b>裁剪后 batch 重新 padding</b><br>由于每个样本裁剪后长度可能不同，需要重新 pad input_ids、attention_mask、labels、moe_token_types、position_ids。<br><br><b>解释：</b>batch size 变大或多图长度差异变大时，该段可能增加。</td></tr>
+<tr><td><span class='mono'>vispruner_rope_deltas</span></td><td>裁剪后 rope_deltas 计算</td><td>0.000 ms</td><td>0.137 ms</td><td>0.137 ms（仅 pruned 出现）</td><td><b>裁剪后 rope_deltas 计算</b><br>根据裁剪后的 position_ids 和 attention_mask 重新计算 mrope delta。<br><br><b>解释：</b>用于保证后续生成时位置编码一致。</td></tr>
+<tr><td><span class='mono'>embed_tokens</span></td><td>文本 token embedding</td><td>0.046 ms</td><td>0.045 ms</td><td>-0.001 ms（-1.57%）</td><td><b>文本 token embedding</b><br>将 input_ids 输入词嵌入层，得到 inputs_embeds。<br><br><b>解释：</b>序列变短理论上会略降，但该段很小。</td></tr>
+<tr><td><span class='mono'>scatter_image_embeds</span></td><td>图像特征写入 inputs_embeds</td><td>0.139 ms</td><td>0.111 ms</td><td>-0.028 ms（-20.14%）</td><td><b>图像特征写入 inputs_embeds</b><br>把 image_embeds 写入 input_ids 中 image token 对应的位置。<br><br><b>解释：</b>视觉 token 变少后通常会下降，但整体占比很小。</td></tr>
+<tr><td><span class='mono'>scatter_proprioception</span></td><td>机器人状态 embedding 写入</td><td>0.141 ms</td><td>0.135 ms</td><td>-0.006 ms（-4.36%）</td><td><b>机器人状态 embedding 写入</b><br>将 proprioception 经过投影后写入 &lt;|propri|&gt; 对应位置。<br><br><b>解释：</b>与视觉 token 剪枝弱相关。</td></tr>
+<tr><td><span class='mono'>attention_mask_to_device</span></td><td>attention_mask 设备对齐</td><td>0.007 ms</td><td>0.007 ms</td><td>-0.000 ms（-2.78%）</td><td><b>attention_mask 设备对齐</b><br>将 attention_mask 移到 inputs_embeds 所在设备。<br><br><b>解释：</b>通常很小。</td></tr>
+<tr><td><span class='mono'>position_encoding</span></td><td>位置编码与 MoE 分组总段</td><td>0.698 ms</td><td>0.120 ms</td><td>-0.578 ms（-82.82%）</td><td><b>位置编码与 MoE 分组总段</b><br>包含 position_ids/RoPE 准备以及 start_indices/end_indices 等 MoE token 分组索引计算。<br><br><b>解释：</b>pruned 路径中 position_ids 可能已在剪枝前准备，因此该段可能下降，不能简单理解为总位置编码成本减少。</td></tr>
+<tr><td><span class='mono'>position_ids_rope</span></td><td>RoPE position_ids 计算</td><td>0.552 ms</td><td>0.000 ms</td><td>-0.552 ms（-100.00%）</td><td><b>RoPE position_ids 计算</b><br>根据 input_ids、image_grid_thw、attention_mask 等计算 3D mRoPE position ids。<br><br><b>解释：</b>baseline 中通常在这里发生；pruned 中可能提前到 pruning_position_ids_prepare。</td></tr>
+<tr><td><span class='mono'>moe_indices</span></td><td>MoE token 分组索引</td><td>0.095 ms</td><td>0.096 ms</td><td>0.001 ms（0.74%）</td><td><b>MoE token 分组索引</b><br>根据 moe_token_types 统计每个 expert 的 token 数，并计算 start/end indices。<br><br><b>解释：</b>与视觉 token 数略相关，但本实验中影响很小。</td></tr>
+<tr><td><span class='mono'>action_initialization</span></td><td>动作扩散初始化总段</td><td>0.472 ms</td><td>0.474 ms</td><td>0.001 ms（0.30%）</td><td><b>动作扩散初始化总段</b><br>生成初始噪声、时间步、第一次 action embedding，并写入 action token 位置。<br><br><b>解释：</b>主要与 action_horizon/action_dim 相关，与视觉 token 剪枝弱相关。</td></tr>
+<tr><td><span class='mono'>action_init_noise</span></td><td>初始噪声和时间步准备</td><td>0.052 ms</td><td>0.050 ms</td><td>-0.001 ms（-2.86%）</td><td><b>初始噪声和时间步准备</b><br>生成 noisy_action 和 times/dt。<br><br><b>解释：</b>与视觉剪枝无关。</td></tr>
+<tr><td><span class='mono'>action_init_embed</span></td><td>初始 action embedding</td><td>0.278 ms</td><td>0.274 ms</td><td>-0.005 ms（-1.71%）</td><td><b>初始 action embedding</b><br>根据 timestep 和 noisy_action 生成 action token embedding。<br><br><b>解释：</b>与视觉剪枝无关。</td></tr>
+<tr><td><span class='mono'>scatter_action_init</span></td><td>初始 action embedding 写入</td><td>0.061 ms</td><td>0.060 ms</td><td>-0.001 ms（-2.43%）</td><td><b>初始 action embedding 写入</b><br>把 action embedding 写入 inputs_embeds 中 action token 对应位置。<br><br><b>解释：</b>与视觉剪枝弱相关。</td></tr>
+<tr><td><span class='mono'>prefetch_forward</span></td><td>prefix/prefill 总段</td><td>30.905 ms</td><td>31.142 ms</td><td>0.237 ms（0.77%）</td><td><b>prefix/prefill 总段</b><br>完整输入序列第一次进入主 Transformer，生成 hidden states 和 prefix KV-cache，并做第一次 action prediction。<br><br><b>解释：</b>这是视觉 token 变少最可能产生收益的主模型阶段之一。</td></tr>
+<tr><td><span class='mono'>prefill_transformer</span></td><td>prefill Transformer</td><td>30.681 ms</td><td>30.931 ms</td><td>0.250 ms（0.82%）</td><td><b>prefill Transformer</b><br>self.model 对完整 inputs_embeds 的第一次 forward，不含后面的 action head。<br><br><b>解释：</b>如果视觉 token 剪枝有效降低主 Transformer 计算，这里应明显下降。本实验中没有明显下降。</td></tr>
+<tr><td><span class='mono'>prefill_action_head</span></td><td>prefill action head</td><td>0.160 ms</td><td>0.150 ms</td><td>-0.010 ms（-6.35%）</td><td><b>prefill action head</b><br>从 action token hidden states 预测初始动作速度/动作，并更新 noisy_action。<br><br><b>解释：</b>主要与 action token 数相关，与视觉 token 剪枝弱相关。</td></tr>
+<tr><td><span class='mono'>cache_preprocessing</span></td><td>KV-cache 与 postfix 输入准备总段</td><td>1.387 ms</td><td>1.348 ms</td><td>-0.040 ms（-2.86%）</td><td><b>KV-cache 与 postfix 输入准备总段</b><br>裁剪 prefix KV-cache，切出 postfix 输入、postfix position ids、postfix moe_token_types，并构造 postfix attention mask。<br><br><b>解释：</b>是 ODE 前的准备工作。</td></tr>
+<tr><td><span class='mono'>prefix_length_resolve</span></td><td>prefix 长度确定</td><td>0.082 ms</td><td>0.076 ms</td><td>-0.006 ms（-7.51%）</td><td><b>prefix 长度确定</b><br>根据 action token 位置确定 prefix_length。<br><br><b>解释：</b>通常很小。</td></tr>
+<tr><td><span class='mono'>kv_cache_trim</span></td><td>KV-cache 裁剪</td><td>0.875 ms</td><td>0.873 ms</td><td>-0.002 ms（-0.19%）</td><td><b>KV-cache 裁剪</b><br>将 prefill 得到的 KV-cache 裁剪到 prefix 部分，供 ODE/postfix 阶段复用。<br><br><b>解释：</b>与 prefix 长度相关。</td></tr>
+<tr><td><span class='mono'>postfix_slice</span></td><td>postfix 张量切片</td><td>0.057 ms</td><td>0.058 ms</td><td>0.001 ms（1.73%）</td><td><b>postfix 张量切片</b><br>从完整输入中切出 action/postfix 部分。<br><br><b>解释：</b>通常很小。</td></tr>
+<tr><td><span class='mono'>postfix_moe_indices</span></td><td>postfix MoE 分组</td><td>0.111 ms</td><td>0.107 ms</td><td>-0.004 ms（-3.74%）</td><td><b>postfix MoE 分组</b><br>为 postfix 阶段重新计算 expert token 分组。<br><br><b>解释：</b>通常很小。</td></tr>
+<tr><td><span class='mono'>postfix_mask_build</span></td><td>postfix attention mask 构造</td><td>0.151 ms</td><td>0.138 ms</td><td>-0.013 ms（-8.34%）</td><td><b>postfix attention mask 构造</b><br>构造 postfix query 到 prefix+postfix key 的 attention mask，并处理 padding/causal action mask。<br><br><b>解释：</b>与 prefix/postfix 长度相关，但本实验中占比小。</td></tr>
+<tr><td><span class='mono'>ode_integration</span></td><td>ODE 多步动作生成总段</td><td>287.742 ms</td><td>287.361 ms</td><td>-0.381 ms（-0.13%）</td><td><b>ODE 多步动作生成总段</b><br>torchdiffeq.odeint 的 euler 多步过程。每一步会更新 action embedding，使用 prefix KV-cache 跑 postfix Transformer，再经过 action head 得到动作速度。<br><br><b>解释：</b>这是本实验最大的耗时段。若它不随视觉 token 减少而下降，则端到端加速会非常有限。</td></tr>
+<tr><td><span class='mono'>ode_action_embed_total</span></td><td>ODE 每步 action embedding 累计</td><td>2.851 ms</td><td>2.814 ms</td><td>-0.037 ms（-1.30%）</td><td><b>ODE 每步 action embedding 累计</b><br>ODE 每个时间步中，根据当前 noisy_action 生成 action embedding 的累计耗时。<br><br><b>解释：</b>timing_counts 显示本实验累计了 9 次，说明 ODE 实际执行 9 个 postfix step。</td></tr>
+<tr><td><span class='mono'>ode_prepare_inputs</span></td><td>ODE 每步输入准备累计</td><td>0.671 ms</td><td>0.664 ms</td><td>-0.007 ms（-1.00%）</td><td><b>ODE 每步输入准备累计</b><br>clone postfix_inputs_embeds，并写入当前步 action embedding。<br><br><b>解释：</b>与视觉 token 剪枝弱相关。</td></tr>
+<tr><td><span class='mono'>ode_transformer_total</span></td><td>ODE 每步 postfix Transformer 累计</td><td>280.841 ms</td><td>280.533 ms</td><td>-0.308 ms（-0.11%）</td><td><b>ODE 每步 postfix Transformer 累计</b><br>ODE 每个时间步中，带 prefix KV-cache 运行 postfix Transformer 的累计耗时。<br><br><b>解释：</b>这是完整动作推理最大头。当前视觉剪枝主要减少 prefix 视觉 token，但 postfix 阶段主要围绕 action token 和 prefix cache，因此收益很小。</td></tr>
+<tr><td><span class='mono'>ode_action_head_total</span></td><td>ODE 每步 action head 累计</td><td>1.031 ms</td><td>1.015 ms</td><td>-0.017 ms（-1.61%）</td><td><b>ODE 每步 action head 累计</b><br>从 postfix Transformer 输出中取 action token hidden states 并投影为动作速度。<br><br><b>解释：</b>主要与 action token 数相关。</td></tr>
+<tr><td><span class='mono'>postprocessing</span></td><td>输出后处理</td><td>0.010 ms</td><td>0.009 ms</td><td>-0.000 ms（-2.90%）</td><td><b>输出后处理</b><br>取 ODE 最后一步动作，按需反归一化并组装输出。<br><br><b>解释：</b>通常很小。</td></tr>
+</table>
+<h2>5. 与“加速很小”问题直接相关的关键证据</h2>
+<ol>
+<li><b>视觉 token 确实减少：</b>平均从 63.00 降到 32.00，下降 49.21%。这说明剪枝逻辑本身生效。</li>
+<li><b>图像路径没有变快：</b><span class='mono'>vision_image_forward</span> 从 24.497 ms 到 24.742 ms，反而略慢。原因是 pruned 需要 <span class='mono'>vision_image_encode_score</span> 获取 attention score，还要执行 <span class='mono'>vispruner_total</span>。</li>
+<li><b>prefill Transformer 没有明显收益：</b><span class='mono'>prefill_transformer</span> 从 30.681 ms 到 30.931 ms。本轮测试没有体现出视觉 token 缩短带来的 prefix 主模型加速。</li>
+<li><b>最大耗时段几乎不变：</b><span class='mono'>ode_transformer_total</span> 从 280.841 ms 到 280.533 ms。完整推理大部分时间花在 ODE/postfix Transformer，这部分主要围绕 action token 和 prefix cache 运行，因此对视觉 token 裁剪不敏感。</li>
+</ol>
+<h2>6. 逐图 paired total_time 结果</h2>
+<table>
+<tr><th>序号</th><th>图片</th><th>token before</th><th>token after</th><th>token 下降</th><th>baseline total</th><th>pruned total</th><th>变化</th></tr>
+<tr><td>1</td><td><span class='mono'>picsum_000.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>347.490 ms</td><td>349.419 ms</td><td>1.929 ms（0.56%）</td></tr>
+<tr><td>2</td><td><span class='mono'>picsum_001.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>346.515 ms</td><td>347.623 ms</td><td>1.107 ms（0.32%）</td></tr>
+<tr><td>3</td><td><span class='mono'>picsum_002.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>344.589 ms</td><td>344.727 ms</td><td>0.138 ms（0.04%）</td></tr>
+<tr><td>4</td><td><span class='mono'>picsum_003.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>345.831 ms</td><td>347.272 ms</td><td>1.440 ms（0.42%）</td></tr>
+<tr><td>5</td><td><span class='mono'>picsum_004.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>354.449 ms</td><td>346.357 ms</td><td>-8.091 ms（-2.28%）</td></tr>
+<tr><td>6</td><td><span class='mono'>picsum_005.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>354.682 ms</td><td>343.622 ms</td><td>-11.060 ms（-3.12%）</td></tr>
+<tr><td>7</td><td><span class='mono'>picsum_006.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>350.350 ms</td><td>344.518 ms</td><td>-5.832 ms（-1.66%）</td></tr>
+<tr><td>8</td><td><span class='mono'>picsum_007.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>348.255 ms</td><td>341.965 ms</td><td>-6.291 ms（-1.81%）</td></tr>
+<tr><td>9</td><td><span class='mono'>picsum_008.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>344.535 ms</td><td>340.741 ms</td><td>-3.794 ms（-1.10%）</td></tr>
+<tr><td>10</td><td><span class='mono'>picsum_009.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>342.402 ms</td><td>349.502 ms</td><td>7.100 ms（2.07%）</td></tr>
+<tr><td>11</td><td><span class='mono'>picsum_010.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>343.878 ms</td><td>348.752 ms</td><td>4.874 ms（1.42%）</td></tr>
+<tr><td>12</td><td><span class='mono'>picsum_011.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>342.213 ms</td><td>343.465 ms</td><td>1.252 ms（0.37%）</td></tr>
+<tr><td>13</td><td><span class='mono'>picsum_012.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>342.996 ms</td><td>343.565 ms</td><td>0.569 ms（0.17%）</td></tr>
+<tr><td>14</td><td><span class='mono'>picsum_013.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>341.849 ms</td><td>342.078 ms</td><td>0.229 ms（0.07%）</td></tr>
+<tr><td>15</td><td><span class='mono'>picsum_014.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>344.384 ms</td><td>342.358 ms</td><td>-2.026 ms（-0.59%）</td></tr>
+<tr><td>16</td><td><span class='mono'>picsum_015.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>347.788 ms</td><td>341.979 ms</td><td>-5.810 ms（-1.67%）</td></tr>
+<tr><td>17</td><td><span class='mono'>picsum_016.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>344.178 ms</td><td>346.692 ms</td><td>2.515 ms（0.73%）</td></tr>
+<tr><td>18</td><td><span class='mono'>picsum_017.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>347.007 ms</td><td>347.325 ms</td><td>0.319 ms（0.09%）</td></tr>
+<tr><td>19</td><td><span class='mono'>picsum_018.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>347.331 ms</td><td>343.983 ms</td><td>-3.348 ms（-0.96%）</td></tr>
+<tr><td>20</td><td><span class='mono'>picsum_019.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>344.482 ms</td><td>346.352 ms</td><td>1.869 ms（0.54%）</td></tr>
+<tr><td>21</td><td><span class='mono'>picsum_020.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>343.889 ms</td><td>350.059 ms</td><td>6.170 ms（1.79%）</td></tr>
+<tr><td>22</td><td><span class='mono'>picsum_021.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>345.111 ms</td><td>350.387 ms</td><td>5.276 ms（1.53%）</td></tr>
+<tr><td>23</td><td><span class='mono'>picsum_022.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>344.359 ms</td><td>349.028 ms</td><td>4.669 ms（1.36%）</td></tr>
+<tr><td>24</td><td><span class='mono'>picsum_023.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>342.195 ms</td><td>345.781 ms</td><td>3.587 ms（1.05%）</td></tr>
+<tr><td>25</td><td><span class='mono'>picsum_024.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>350.557 ms</td><td>347.355 ms</td><td>-3.201 ms（-0.91%）</td></tr>
+<tr><td>26</td><td><span class='mono'>picsum_025.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>354.698 ms</td><td>346.584 ms</td><td>-8.114 ms（-2.29%）</td></tr>
+<tr><td>27</td><td><span class='mono'>picsum_026.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>348.733 ms</td><td>346.660 ms</td><td>-2.073 ms（-0.59%）</td></tr>
+<tr><td>28</td><td><span class='mono'>picsum_027.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>344.995 ms</td><td>346.367 ms</td><td>1.372 ms（0.40%）</td></tr>
+<tr><td>29</td><td><span class='mono'>picsum_028.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>344.500 ms</td><td>343.319 ms</td><td>-1.180 ms（-0.34%）</td></tr>
+<tr><td>30</td><td><span class='mono'>picsum_029.jpg</span></td><td>63</td><td>32</td><td>49.21%</td><td>344.484 ms</td><td>344.035 ms</td><td>-0.449 ms（-0.13%）</td></tr>
+</table>
+<h2>7. timing_counts 说明</h2>
+<p>timing_counts 表示某个时间戳在一次被统计的模型调用中累计了多少次。多数阶段为 1；ODE 内部阶段为 9，说明本实验中 ODE euler 实际执行了 9 个 postfix Transformer step。</p>
+<table>
+<tr><th>版本</th><th>时间戳</th><th>count</th></tr>
+<tr><td>baseline</td><td><span class='mono'>ode_action_embed_total</span></td><td>9</td></tr>
+<tr><td>baseline</td><td><span class='mono'>ode_action_head_total</span></td><td>9</td></tr>
+<tr><td>baseline</td><td><span class='mono'>ode_integration</span></td><td>1</td></tr>
+<tr><td>baseline</td><td><span class='mono'>ode_prepare_inputs</span></td><td>9</td></tr>
+<tr><td>baseline</td><td><span class='mono'>ode_transformer_total</span></td><td>9</td></tr>
+<tr><td>baseline</td><td><span class='mono'>prefill_transformer</span></td><td>1</td></tr>
+<tr><td>baseline</td><td><span class='mono'>total_time</span></td><td>1</td></tr>
+<tr><td>baseline</td><td><span class='mono'>vision_image_forward</span></td><td>1</td></tr>
+<tr><td>pruned</td><td><span class='mono'>ode_action_embed_total</span></td><td>9</td></tr>
+<tr><td>pruned</td><td><span class='mono'>ode_action_head_total</span></td><td>9</td></tr>
+<tr><td>pruned</td><td><span class='mono'>ode_integration</span></td><td>1</td></tr>
+<tr><td>pruned</td><td><span class='mono'>ode_prepare_inputs</span></td><td>9</td></tr>
+<tr><td>pruned</td><td><span class='mono'>ode_transformer_total</span></td><td>9</td></tr>
+<tr><td>pruned</td><td><span class='mono'>prefill_transformer</span></td><td>1</td></tr>
+<tr><td>pruned</td><td><span class='mono'>total_time</span></td><td>1</td></tr>
+<tr><td>pruned</td><td><span class='mono'>vision_image_forward</span></td><td>1</td></tr>
+</table>
+<h2>8. 实验局限与下一步建议</h2>
+<ul>
+<li>本报告使用 picsum 随机图片，不是机器人真实任务帧；它适合性能诊断，不代表任务成功率或真实数据分布。</li>
+<li>所有细粒度时间戳都在 profile_timing=True 下测量，会引入 CUDA 同步开销。因此应看 baseline/pruned 的相对差异，而不是把绝对时间当作线上延迟。</li>
+<li>当前 topk_attention 策略需要先完整运行视觉塔并输出 attention score。若想得到明显端到端加速，下一步应尝试更低成本的打分方式，或在 vision tower 更早阶段剪枝。</li>
+<li>若目标是动作推理端到端加速，还需要分析 ODE/postfix Transformer：减少 ODE step、优化 postfix attention、缓存 action-invariant 部分，可能比单纯视觉 token 剪枝更直接。</li>
+</ul>
+<h2>9. 原始结果文件</h2>
+<p>结构化 JSON 原始结果：<span class='mono'>/root/autodl-tmp/wall_x/wall_x/report/wallx_vispruner_30image_timing_results.json</span></p>
+</body></html>
