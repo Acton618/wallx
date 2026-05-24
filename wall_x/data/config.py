@@ -37,6 +37,7 @@ ACTION_DATASET_NAMES = [
     "utaustin_mutex",
     "viola",
     "physical-intelligence/libero",
+    "libero_all",
     "lerobot/aloha_mobile_cabinet",
 ]
 

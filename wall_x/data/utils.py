@@ -51,6 +51,14 @@ KEY_MAPPINGS = {
         "state": "observation.state",
         "action": "action",
     },
+    "libero_all": {
+        "camera": {
+            "observation.images.faceImg": "face_view",
+            "observation.images.rightImg": "right_wrist_view",
+        },
+        "state": "observation.state",
+        "action": "action",
+    },
     "robochallenge_aloha": {
         "camera": {
             "observation.images.cam_high_rgb": "face_view",

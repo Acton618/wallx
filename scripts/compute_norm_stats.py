@@ -97,7 +97,7 @@ def load_lerobot_dataset(
 ) -> None:
 
     # Load local or remote dataset
-    dataset = LeRobotDataset(base_dir)
+    dataset = LeRobotDataset(repo_id, root=base_dir)
 
     # Iterate through all data
     frames: Dict[str, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
@@ -157,9 +157,9 @@ def compute_action_normalizer(
 
 def main() -> None:
 
-    repo_id = "xxx"  # your dataset name
-    data_root_path = "/path/to/lerobot/dataset"
-    output_stats_dir = "/path/to/save/action_stats"
+    repo_id = "libero_all"  # your dataset name
+    data_root_path = "/root/autodl-tmp/wall_x/datasheet"
+    output_stats_dir = "/root/autodl-tmp/wall_x/workspace/libero_all_norm_stats"
     trajectory_keys = {  # your dataset keys
         "propri": {
             "follow_right_ee_cartesian_pos": [0, 3],
