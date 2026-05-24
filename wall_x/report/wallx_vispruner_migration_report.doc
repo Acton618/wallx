@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Wall-X 视觉 Token 剪枝移植与初步性能对比报告</title>
+  <style>
+    body {
+      font-family: "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.65;
+      color: #222;
+      margin: 36px;
+    }
+    h1, h2, h3 {
+      color: #1f2937;
+    }
+    h1 {
+      text-align: center;
+      font-size: 24px;
+      margin-bottom: 6px;
+    }
+    .meta {
+      text-align: center;
+      color: #555;
+      margin-bottom: 28px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 12px 0 22px 0;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid #999;
+      padding: 8px 10px;
+      vertical-align: top;
+    }
+    th {
+      background: #f1f5f9;
+      font-weight: bold;
+    }
+    code {
+      font-family: Consolas, monospace;
+      background: #f6f8fa;
+      padding: 1px 4px;
+    }
+    pre {
+      background: #f6f8fa;
+      border: 1px solid #ddd;
+      padding: 10px;
+      white-space: pre-wrap;
+    }
+    .ok {
+      color: #166534;
+      font-weight: bold;
+    }
+    .warn {
+      color: #92400e;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <h1>Wall-X 视觉 Token 剪枝移植与初步性能对比报告</h1>
+  <div class="meta">
+    生成日期：2026-05-24<br>
+    项目目录：/root/autodl-tmp/wall_x/wall_x
+  </div>
+
+  <h2>1. 工作目标</h2>
+  <p>
+    本阶段工作的目标是在 Wall-X 模型中引入类似 VisPruner 的视觉 token 筛选思想，
+    在保留原始 Wall-X 图像处理链路的前提下，通过配置开关启用新的视觉 token 剪枝路径，
+    并对原始版本与剪枝版本进行初步运行对比。
+  </p>
+
+  <h2>2. 已完成的移植工作</h2>
+  <h3>2.1 保留原始处理方式</h3>
+  <p>
+    当前实现保留了 Wall-X 原始图像处理方式。默认配置为关闭剪枝：
+  </p>
+  <pre>vispruner:
+  enable: false
+  strategy: original
+  keep_ratio: 1.0
+  min_tokens: 1
+  force_vision_eager: true</pre>
+  <p>
+    在该配置下，模型仍走原始路径：
+  </p>
+  <pre>pixel_values -> vision tower -> image_embeds -> masked_scatter -> Wall-X 主 Transformer</pre>
+
+  <h3>2.2 新增剪枝开关与策略字段</h3>
+  <p>
+    在模型配置中新增以下字段：
+  </p>
+  <ul>
+    <li><code>vispruner_enable</code>：是否启用视觉 token 剪枝。</li>
+    <li><code>vispruner_strategy</code>：剪枝策略，目前支持 <code>original</code> 和 <code>topk_attention</code>。</li>
+    <li><code>vispruner_keep_ratio</code>：视觉 token 保留比例。</li>
+    <li><code>vispruner_min_tokens</code>：每张图最少保留 token 数。</li>
+    <li><code>vispruner_force_vision_eager</code>：剪枝时是否强制视觉 attention 使用 eager，以便获取 attention score。</li>
+  </ul>
+
+  <h3>2.3 新增文件与关键修改位置</h3>
+  <table>
+    <tr>
+      <th>文件</th>
+      <th>作用</th>
+    </tr>
+    <tr>
+      <td><code>model/vispruner_token_pruner.py</code></td>
+      <td>新增视觉 token 剪枝模块，负责根据 score 选择保留 token，并同步裁剪 <code>input_ids</code>、<code>attention_mask</code>、<code>moe_token_types</code>、<code>position_ids</code> 等张量。</td>
+    </tr>
+    <tr>
+      <td><code>model/qwen2_5_based/configuration_qwen2_5_vl.py</code></td>
+      <td>新增 VisPruner 相关配置字段，默认关闭剪枝。</td>
+    </tr>
+    <tr>
+      <td><code>model/model_utils.py</code></td>
+      <td>从训练/推理 YAML 配置中读取并传递 VisPruner 配置。</td>
+    </tr>
+    <tr>
+      <td><code>trainer/qwen_vl_act_trainer.py</code></td>
+      <td>训练入口同步读取 VisPruner 配置。</td>
+    </tr>
+    <tr>
+      <td><code>infer/infer_config.py</code></td>
+      <td>推理配置中避免剪枝时将视觉 attention 覆盖回 flash attention。</td>
+    </tr>
+    <tr>
+      <td><code>model/qwen2_5_based/modeling_qwen2_5_vl.py</code></td>
+      <td>视觉编码器新增可选 <code>output_attentions=True</code> 返回视觉 token score 的能力。普通调用仍保持原始返回 tensor 的行为。</td>
+    </tr>
+    <tr>
+      <td><code>model/qwen2_5_based/modeling_qwen2_5_vl_act.py</code></td>
+      <td>在图像 embedding 注入主 Transformer 前接入可选剪枝路径；默认仍走原始路径。</td>
+    </tr>
+    <tr>
+      <td><code>scripts/vision_shape_check.py</code></td>
+      <td>增强单图测试脚本，支持通过 <code>--train-config</code> 读取 YAML 配置测试原始/剪枝两种路径。</td>
+    </tr>
+  </table>
+
+  <h3>2.4 当前剪枝策略</h3>
+  <p>
+    当前接入的策略名称为 <code>topk_attention</code>。其核心思想是：
+  </p>
+  <pre>vision tower 输出 image_embeds 和 image_scores
+根据 image_scores 或 image_embeds norm 进行 top-k 筛选
+保留得分较高的视觉 token
+同步删除 input_ids 中对应的 image token
+再将裁剪后的 image_embeds 注入主模型</pre>
+  <p>
+    注意：该策略是当前移植版本的初步策略，属于“基于分数的 top-k token 筛选”。
+    它还不是完整 VisPruner 原论文中“重要性 + 多样性/相似度去冗余”的完整实现。
+  </p>
+
+  <h2>3. 测试输入与测试方法</h2>
+  <p>
+    单图测试使用脚本：
+  </p>
+  <pre>python ../scripts/vision_shape_check.py --train-config /root/autodl-tmp/wall_x/workspace/lerobot_example/config_qact_from_vlm.yml</pre>
+  <p>
+    默认测试图片路径：
+  </p>
+  <pre>/root/autodl-tmp/wall_x/assets/cot_example_frame.png</pre>
+  <p>
+    测试脚本会构造一条包含图片、语言指令、机器人状态 token 和 action token 的输入，
+    调用 <code>model(**inputs, mode="validate")</code>，用于验证模型前向链路、shape 对齐、数值稳定性和初步耗时。
+  </p>
+
+  <h2>4. 原始版本与剪枝版本运行结果</h2>
+  <h3>4.1 原始版本配置</h3>
+  <pre>vispruner:
+  enable: false
+  strategy: original
+  keep_ratio: 1.0
+  min_tokens: 1
+  force_vision_eager: true</pre>
+
+  <h3>4.2 剪枝版本配置</h3>
+  <pre>vispruner:
+  enable: true
+  strategy: topk_attention
+  keep_ratio: 0.5
+  min_tokens: 1
+  force_vision_eager: true</pre>
+
+  <h3>4.3 指标对比</h3>
+  <table>
+    <tr>
+      <th>指标</th>
+      <th>原始版本</th>
+      <th>剪枝版本</th>
+      <th>对比结论</th>
+    </tr>
+    <tr>
+      <td>剪枝开关</td>
+      <td><code>vispruner_enable=False</code></td>
+      <td><code>vispruner_enable=True</code></td>
+      <td>开关生效。</td>
+    </tr>
+    <tr>
+      <td>剪枝策略</td>
+      <td><code>original</code></td>
+      <td><code>topk_attention</code></td>
+      <td>策略切换成功。</td>
+    </tr>
+    <tr>
+      <td>输入序列长度</td>
+      <td>476</td>
+      <td>476</td>
+      <td>两次测试使用相同输入。</td>
+    </tr>
+    <tr>
+      <td>原始图像 token 数</td>
+      <td>391</td>
+      <td>391</td>
+      <td>同一张图片经过 processor 后产生相同数量图像 token。</td>
+    </tr>
+    <tr>
+      <td>输出 logits shape</td>
+      <td><code>(1, 476, 153715)</code></td>
+      <td><code>(1, 281, 153715)</code></td>
+      <td class="ok">剪枝后主模型实际处理序列长度明显下降。</td>
+    </tr>
+    <tr>
+      <td>输出序列长度</td>
+      <td>476</td>
+      <td>281</td>
+      <td class="ok">减少 195 个 token。</td>
+    </tr>
+    <tr>
+      <td>序列长度下降比例</td>
+      <td>-</td>
+      <td>约 40.97%</td>
+      <td class="ok">token 剪枝效果符合 <code>keep_ratio=0.5</code> 的预期。</td>
+    </tr>
+    <tr>
+      <td>forward_time_ms</td>
+      <td>382.009 ms</td>
+      <td>380.757 ms</td>
+      <td class="warn">剪枝版本仅快约 1.252 ms，约 0.33%，不能认为有明显端到端加速。</td>
+    </tr>
+    <tr>
+      <td>peak_memory_gb</td>
+      <td>8.293 GB</td>
+      <td>8.369 GB</td>
+      <td class="warn">剪枝版本显存增加约 0.076 GB，约 0.92%。</td>
+    </tr>
+    <tr>
+      <td>NaN</td>
+      <td>False</td>
+      <td>False</td>
+      <td class="ok">无 NaN。</td>
+    </tr>
+    <tr>
+      <td>Inf</td>
+      <td>False</td>
+      <td>False</td>
+      <td class="ok">无 Inf。</td>
+    </tr>
+    <tr>
+      <td>测试状态</td>
+      <td>PASS</td>
+      <td>PASS</td>
+      <td class="ok">两条路径均可稳定完成单图前向测试。</td>
+    </tr>
+  </table>
+
+  <h2>5. 结果分析</h2>
+  <h3>5.1 已经验证成功的部分</h3>
+  <ul>
+    <li>原始 Wall-X 处理路径得到保留，关闭剪枝时输出序列长度仍为 476。</li>
+    <li>剪枝开关与 <code>strategy</code> 策略字段生效。</li>
+    <li>剪枝版本成功将输出序列长度从 476 降至 281。</li>
+    <li>剪枝后 logits shape 仍然合法，模型接口没有被破坏。</li>
+    <li>两种版本输出均无 NaN/Inf，数值稳定。</li>
+  </ul>
+
+  <h3>5.2 关于速度结果</h3>
+  <p>
+    本次单图 <code>validate logits forward</code> 测试中，剪枝版本耗时为 380.757 ms，
+    原始版本耗时为 382.009 ms，差异约 1.252 ms，比例约 0.33%。
+    该差异非常小，可能属于单次测量波动，因此目前不能证明剪枝版本已经带来明显端到端推理加速。
+  </p>
+  <p>
+    造成加速不明显的主要原因可能包括：
+  </p>
+  <ul>
+    <li>当前剪枝发生在 vision tower 之后，因此不能减少视觉编码器本身的计算量。</li>
+    <li><code>topk_attention</code> 需要获取视觉 attention score，因此剪枝时会强制使用 eager attention，可能抵消后续 Transformer 序列变短带来的收益。</li>
+    <li>当前测试为单图、batch size 为 1，token 减少带来的收益较小。</li>
+    <li>本次测试是 <code>validate logits forward</code>，不是完整的 <code>generate_flow_action</code> 机器人动作推理，也不是训练 step。</li>
+  </ul>
+
+  <h2>6. 当前阶段结论</h2>
+  <p class="ok">
+    结论 1：VisPruner 风格视觉 token 剪枝移植已初步成功。
+  </p>
+  <p>
+    依据：剪枝路径可运行，输出 shape 合法，序列长度明显下降，输出无 NaN/Inf。
+  </p>
+  <p class="ok">
+    结论 2：原始 Wall-X 处理方式已保留。
+  </p>
+  <p>
+    依据：关闭剪枝时仍输出 <code>(1, 476, 153715)</code>，与原始链路一致。
+  </p>
+  <p class="warn">
+    结论 3：当前单图 validate forward 测试尚未观察到明显端到端推理加速。
+  </p>
+  <p>
+    依据：剪枝版本仅比原始版本快约 0.33%，显存还略有增加。该结果说明 token 数下降已经发生，
+    但尚未充分转化为端到端耗时下降。
+  </p>
+
+  <h2>7. 后续建议</h2>
+  <ol>
+    <li>
+      增加多轮 benchmark：原始版本和剪枝版本各进行 warmup 3 次、正式统计 20 次，
+      输出平均耗时、最小/最大耗时和显存峰值，避免单次波动误判。
+    </li>
+    <li>
+      使用 <code>generate_flow_action(profile_timing=True, profile_complexity=True)</code>
+      测试真实动作生成路径，而不仅是 <code>validate logits forward</code>。
+    </li>
+    <li>
+      分模块观察耗时：
+      <code>vision_image_forward</code>、<code>prefetch_forward</code>、<code>ode_integration</code>、<code>total_time</code>。
+      重点判断后续 Transformer 是否变快，以及 vision eager attention 是否抵消收益。
+    </li>
+    <li>
+      若目标是训练加速，应进一步测试训练 step，包括 forward、backward、optimizer step、peak memory 和 samples/sec。
+    </li>
+    <li>
+      若当前 <code>topk_attention</code> 策略成本较高，可继续优化 token score 获取方式，
+      或实现更接近完整 VisPruner 的“重要性 + 多样性”筛选策略。
+    </li>
+  </ol>
+
+  <h2>8. 附录：关键测试命令</h2>
+  <h3>原始版本测试</h3>
+  <pre>vispruner:
+  enable: false
+  strategy: original
+  keep_ratio: 1.0
+  min_tokens: 1
+  force_vision_eager: true</pre>
+  <pre>source /root/miniconda3/etc/profile.d/conda.sh
+conda activate wallx
+cd /root/autodl-tmp/wall_x/wall_x
+python ../scripts/vision_shape_check.py --train-config /root/autodl-tmp/wall_x/workspace/lerobot_example/config_qact_from_vlm.yml</pre>
+
+  <h3>剪枝版本测试</h3>
+  <pre>vispruner:
+  enable: true
+  strategy: topk_attention
+  keep_ratio: 0.5
+  min_tokens: 1
+  force_vision_eager: true</pre>
+  <pre>source /root/miniconda3/etc/profile.d/conda.sh
+conda activate wallx
+cd /root/autodl-tmp/wall_x/wall_x
+python ../scripts/vision_shape_check.py --train-config /root/autodl-tmp/wall_x/workspace/lerobot_example/config_qact_from_vlm.yml</pre>
+</body>
+</html>

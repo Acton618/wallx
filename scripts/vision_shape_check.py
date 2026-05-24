@@ -2,6 +2,7 @@ import argparse
 import time
 
 import torch
+import yaml
 from PIL import Image
 
 from wall_x.data.utils import preprocesser_call
@@ -46,16 +47,43 @@ def main() -> None:
     parser.add_argument("--dataset-name", default="x2_normal")
     parser.add_argument("--action-horizon", type=int, default=32)
     parser.add_argument("--action-dim", type=int, default=20)
+    parser.add_argument(
+        "--train-config",
+        default=None,
+        help="Optional Wall-X training YAML. Use this to test config-driven switches such as vispruner.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(0)
     image = Image.open(args.image_path).convert("RGB")
 
-    model = Qwen2_5_VLMoEForAction.from_pretrained(args.model_path)
+    train_config = None
+    if args.train_config is not None:
+        with open(args.train_config, "r") as f:
+            train_config = yaml.safe_load(f)
+        train_config.setdefault("processor_path", args.model_path)
+
+    model = Qwen2_5_VLMoEForAction.from_pretrained(
+        args.model_path, train_config=train_config
+    )
     model.eval()
     model = model.to(args.device)
     model = model.bfloat16()
     processor = model.processor
+
+    print("[ShapeCheck] ===== model config =====")
+    print(
+        f"[ShapeCheck] vispruner_enable={getattr(model.config, 'vispruner_enable', False)}"
+    )
+    print(
+        f"[ShapeCheck] vispruner_strategy={getattr(model.config, 'vispruner_strategy', 'original')}"
+    )
+    print(
+        f"[ShapeCheck] vispruner_keep_ratio={getattr(model.config, 'vispruner_keep_ratio', 1.0)}"
+    )
+    print(
+        f"[ShapeCheck] pruner_enabled={getattr(model, 'vispruner', None).enabled if hasattr(model, 'vispruner') else False}"
+    )
 
     inputs = preprocesser_call(
         processor=processor,
@@ -149,6 +177,7 @@ def main() -> None:
 
     print("[ShapeCheck] ===== outputs =====")
     print_tensor_shape("logits", outputs.logits)
+    print(f"[ShapeCheck] output_seq_len={outputs.logits.shape[1]}")
     print(f"[ShapeCheck] forward_time_ms={elapsed_ms:.3f}")
     print(f"[ShapeCheck] peak_memory_gb={peak_mem_gb:.3f}")
     print(f"[ShapeCheck] logits_has_nan={torch.isnan(outputs.logits).any().item()}")
