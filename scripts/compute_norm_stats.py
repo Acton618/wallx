@@ -158,7 +158,7 @@ def compute_action_normalizer(
 def main() -> None:
 
     repo_id = "libero_all"  # your dataset name
-    data_root_path = "/root/autodl-tmp/wall_x/datasheet"
+    data_root_path = "/root/autodl-tmp/wall_x/datasheet/libero_all"
     output_stats_dir = "/root/autodl-tmp/wall_x/workspace/libero_all_norm_stats"
     trajectory_keys = {  # your dataset keys
         "propri": {
