@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Wall-X 视觉 Token 筛选成果定位</title>
+  <style>
+    body {
+      font-family: "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.65;
+      color: #222;
+      margin: 36px;
+    }
+    h1, h2, h3 {
+      color: #1f2937;
+    }
+    h1 {
+      text-align: center;
+      font-size: 24px;
+      margin-bottom: 8px;
+    }
+    .meta {
+      text-align: center;
+      color: #555;
+      margin-bottom: 28px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 12px 0 22px 0;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid #999;
+      padding: 8px 10px;
+      vertical-align: top;
+    }
+    th {
+      background: #f1f5f9;
+      font-weight: bold;
+    }
+    code {
+      font-family: Consolas, monospace;
+      background: #f6f8fa;
+      padding: 1px 4px;
+    }
+    pre {
+      background: #f6f8fa;
+      border: 1px solid #ddd;
+      padding: 10px;
+      white-space: pre-wrap;
+    }
+    .ok {
+      color: #166534;
+      font-weight: bold;
+    }
+    .warn {
+      color: #92400e;
+      font-weight: bold;
+    }
+    .note {
+      background: #fff7d6;
+      border: 1px solid #d8bf60;
+      padding: 10px 12px;
+      margin: 12px 0 20px 0;
+    }
+  </style>
+</head>
+<body>
+  <h1>Wall-X 视觉 Token 筛选成果定位</h1>
+  <div class="meta">
+    项目目录：/root/autodl-tmp/wall_x<br>
+    报告主题：大创项目成果展示口径与指标选择
+  </div>
+
+  <h2>1. 成果定位</h2>
+  <p>
+    本项目的核心成果可以定位为：在 Wall-X 机器人视觉语言动作模型中，完成视觉 token 筛选机制的移植、
+    接入、开关化配置与性能诊断。当前工作重点不是宣称端到端推理获得大幅加速，而是证明视觉 token
+    筛选链路已经真实生效，并分析其在 Wall-X 动作推理流程中的收益边界与瓶颈来源。
+  </p>
+  <div class="note">
+    建议表述：本项目实现了 Wall-X 视觉 token 筛选功能，使主模型实际处理的视觉 token 数和序列长度明显下降；
+    同时通过分段计时定位到端到端加速受限的主要原因是 ODE/postfix Transformer 动作生成阶段占主导。
+  </div>
+
+  <h2>2. 推荐展示指标</h2>
+
+  <h3>2.1 视觉 Token 削减比例</h3>
+  <p>
+    该指标最直接证明视觉 token 筛选功能有效，适合作为成果展示的主结果。
+  </p>
+  <table>
+    <tr>
+      <th>指标</th>
+      <th>原始版本</th>
+      <th>筛选版本</th>
+      <th>变化</th>
+      <th>展示价值</th>
+    </tr>
+    <tr>
+      <td>平均视觉 token 数</td>
+      <td>63.00</td>
+      <td>32.00</td>
+      <td class="ok">减少 49.21%</td>
+      <td>证明筛选逻辑真实生效，视觉 token 数接近减半。</td>
+    </tr>
+  </table>
+
+  <h3>2.2 主模型序列长度下降</h3>
+  <p>
+    如果采用迁移报告中的单图 shape check 数据，可以展示主 Transformer 实际处理序列长度明显下降，
+    说明剪枝不是只发生在统计层面，而是已经影响到模型输入序列。
+  </p>
+  <table>
+    <tr>
+      <th>指标</th>
+      <th>原始版本</th>
+      <th>筛选版本</th>
+      <th>变化</th>
+      <th>展示价值</th>
+    </tr>
+    <tr>
+      <td>输出 logits 序列长度</td>
+      <td>476</td>
+      <td>281</td>
+      <td class="ok">下降约 40.97%</td>
+      <td>证明主模型处理序列被实际缩短。</td>
+    </tr>
+  </table>
+
+  <h3>2.3 视觉相关局部阶段加速</h3>
+  <p>
+    这些局部指标比端到端总时长更能体现视觉 token 筛选对相关模块的直接影响。
+    展示时应说明这些是局部模块收益，而不是完整推理收益。
+  </p>
+  <table>
+    <tr>
+      <th>阶段</th>
+      <th>原始版本</th>
+      <th>筛选版本</th>
+      <th>变化</th>
+      <th>说明</th>
+    </tr>
+    <tr>
+      <td><code>scatter_image_embeds</code></td>
+      <td>0.139 ms</td>
+      <td>0.111 ms</td>
+      <td class="ok">下降 20.14%</td>
+      <td>视觉 token 减少后，图像特征写入输入 embedding 的工作量降低。</td>
+    </tr>
+    <tr>
+      <td><code>position_encoding</code></td>
+      <td>0.698 ms</td>
+      <td>0.120 ms</td>
+      <td class="ok">下降 82.82%</td>
+      <td>序列变短后，位置编码与相关索引准备阶段耗时下降明显。</td>
+    </tr>
+    <tr>
+      <td><code>cache_preprocessing</code></td>
+      <td>1.387 ms</td>
+      <td>1.348 ms</td>
+      <td class="ok">下降 2.86%</td>
+      <td>KV-cache 和 postfix 输入准备阶段有小幅收益。</td>
+    </tr>
+  </table>
+
+  <h3>2.4 Pre-ODE 视觉相关链路收益</h3>
+  <p>
+    可以将视觉 token 直接影响的 pre-ODE 链路合并展示，口径如下：
+  </p>
+  <pre>scatter_image_embeds
++ position_encoding
++ prefetch_forward
++ cache_preprocessing</pre>
+  <table>
+    <tr>
+      <th>统计口径</th>
+      <th>原始版本</th>
+      <th>筛选版本</th>
+      <th>变化</th>
+    </tr>
+    <tr>
+      <td>Pre-ODE 视觉相关链路</td>
+      <td>33.129 ms</td>
+      <td>32.721 ms</td>
+      <td class="ok">减少 0.408 ms，约 1.23%</td>
+    </tr>
+  </table>
+  <p>
+    该指标比完整端到端总时间更贴近视觉 token 筛选的作用范围，适合用于解释“局部链路已经产生收益”。
+  </p>
+
+  <h3>2.5 筛选模块自身开销</h3>
+  <p>
+    当前筛选模块自身开销较低，可以作为工程实现有效性的一个补充指标。
+  </p>
+  <table>
+    <tr>
+      <th>指标</th>
+      <th>数值</th>
+      <th>占筛选版本总时间比例</th>
+      <th>说明</th>
+    </tr>
+    <tr>
+      <td><code>vispruner_total</code></td>
+      <td>0.925 ms</td>
+      <td class="ok">约 0.27%</td>
+      <td>筛选模块本身耗时低于 1 ms，占完整模型内部推理时间比例较小。</td>
+    </tr>
+  </table>
+
+  <h2>3. 端到端结果与合理解释</h2>
+  <p>
+    端到端模型内部总时间应作为局限性和瓶颈分析展示，避免只挑选局部指标。
+  </p>
+  <table>
+    <tr>
+      <th>指标</th>
+      <th>原始版本</th>
+      <th>筛选版本</th>
+      <th>变化</th>
+      <th>结论</th>
+    </tr>
+    <tr>
+      <td><code>total_time</code></td>
+      <td>346.291 ms</td>
+      <td>345.729 ms</td>
+      <td class="warn">下降 0.562 ms，约 0.16%</td>
+      <td>端到端加速不明显。</td>
+    </tr>
+  </table>
+  <p>
+    端到端加速有限的主要原因如下：
+  </p>
+  <ul>
+    <li>当前视觉 token 筛选发生在 vision tower 完整编码之后，不能节省视觉编码本身。</li>
+    <li>本次测试中视觉 token 数从 63 降到 32，仅减少 31 个 token，规模较小。</li>
+    <li>Wall-X 动作推理主要耗时集中在 ODE/postfix Transformer 阶段，该阶段约占总时间 83%。</li>
+    <li>ODE 阶段主要围绕 action token 反复运行 Transformer，视觉 token 只作为 prefix KV-cache 条件上下文，因此对视觉 token 数不够敏感。</li>
+  </ul>
+
+  <h2>4. 推荐汇报结构</h2>
+  <ol>
+    <li>
+      <b>功能有效性：</b>视觉 token 数减少 49.21%，主模型输入序列长度明显下降。
+    </li>
+    <li>
+      <b>局部性能收益：</b><code>scatter_image_embeds</code> 下降 20.14%，<code>position_encoding</code> 下降 82.82%。
+    </li>
+    <li>
+      <b>工程开销可控：</b><code>vispruner_total</code> 约 0.925 ms，占总推理时间约 0.27%。
+    </li>
+    <li>
+      <b>端到端瓶颈分析：</b>总时长仅下降 0.16%，主要因为 ODE/postfix Transformer 动作生成阶段占主导。
+    </li>
+    <li>
+      <b>后续优化方向：</b>探索更早阶段的视觉剪枝、更高 token 数场景、多视角真实机器人数据，以及减少 ODE step 的联合优化。
+    </li>
+  </ol>
+
+  <h2>5. 建议使用的汇报表述</h2>
+  <pre>本项目完成了 Wall-X 视觉 token 筛选机制的移植与验证。
+实验结果显示，在 30 张测试图片上，视觉 token 数平均从 63 降至 32，减少 49.21%；
+在单图 shape check 中，主模型处理序列长度从 476 降至 281，下降约 40.97%。
+
+在局部性能上，图像 embedding 写入阶段耗时下降 20.14%，位置编码阶段耗时下降 82.82%，
+筛选模块自身耗时约 0.925 ms，占完整模型内部推理时间不到 0.3%。
+
+同时，实验也发现 Wall-X 端到端动作推理的主要瓶颈并不在视觉 token 处理阶段，
+而在 ODE/postfix Transformer 动作生成阶段。因此当前视觉 token 筛选对完整推理时间的提升有限，
+但为后续结合高分辨率多视角输入、早期视觉剪枝和 ODE step 优化提供了清晰的工程基础与性能诊断依据。</pre>
+
+  <h2>6. 后续补充实验建议</h2>
+  <ul>
+    <li>使用真实机器人多视角图像替代随机自然图片，以验证任务场景下的剪枝稳定性。</li>
+    <li>提高输入分辨率或增加多视角图片数量，使原始视觉 token 数达到几百级别，再观察 prefill 阶段收益。</li>
+    <li>对比 <code>keep_ratio=0.75</code>、<code>0.5</code>、<code>0.25</code> 下的 token 数、局部耗时和动作输出漂移。</li>
+    <li>联合测试减少 <code>num_inference_timesteps</code> 后的端到端加速效果，区分视觉筛选收益和 ODE step 减少收益。</li>
+  </ul>
+</body>
+</html>
