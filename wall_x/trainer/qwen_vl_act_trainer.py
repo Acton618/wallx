@@ -19,6 +19,7 @@ from safetensors.torch import load_file
 from transformers.optimization import get_cosine_with_min_lr_schedule_with_warmup
 from transformers import AutoProcessor
 from wall_x.model.action_head import Normalizer
+from wall_x.model.model_utils import apply_vispruner_config
 from wall_x.utils.timers import Timers
 from wall_x.model.qwen2_5_based import Qwen2_5_VLMoEForAction, Qwen2_5_VLConfig
 from wall_x.utils.constant import action_statistic_dof as default_action_statistic_dof
@@ -97,58 +98,7 @@ def update_model_config(train_config, model_config):
     if train_config.get("_attn_implementation", None) is not None:
         model_config._attn_implementation = train_config["_attn_implementation"]
 
-    vispruner_config = train_config.get("vispruner", {}) or {}
-    model_config.vispruner_enable = bool(
-        vispruner_config.get(
-            "enable",
-            train_config.get(
-                "vispruner_enable", getattr(model_config, "vispruner_enable", False)
-            ),
-        )
-    )
-    model_config.vispruner_strategy = str(
-        vispruner_config.get(
-            "strategy",
-            train_config.get(
-                "vispruner_strategy",
-                getattr(model_config, "vispruner_strategy", "original"),
-            ),
-        )
-    )
-    model_config.vispruner_keep_ratio = float(
-        vispruner_config.get(
-            "keep_ratio",
-            train_config.get(
-                "vispruner_keep_ratio",
-                getattr(model_config, "vispruner_keep_ratio", 1.0),
-            ),
-        )
-    )
-    model_config.vispruner_min_tokens = int(
-        vispruner_config.get(
-            "min_tokens",
-            train_config.get(
-                "vispruner_min_tokens",
-                getattr(model_config, "vispruner_min_tokens", 1),
-            ),
-        )
-    )
-    model_config.vispruner_force_vision_eager = bool(
-        vispruner_config.get(
-            "force_vision_eager",
-            train_config.get(
-                "vispruner_force_vision_eager",
-                getattr(model_config, "vispruner_force_vision_eager", True),
-            ),
-        )
-    )
-
-    if (
-        model_config.vispruner_enable
-        and model_config.vispruner_strategy != "original"
-        and model_config.vispruner_force_vision_eager
-    ):
-        model_config.vision_config._attn_implementation = "eager"
+    model_config = apply_vispruner_config(train_config, model_config)
 
     if train_config.get("attn_deterministic", None) is not None:
         model_config.attn_deterministic = train_config["attn_deterministic"]

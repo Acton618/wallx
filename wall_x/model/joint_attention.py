@@ -10,9 +10,7 @@ from wall_x.model.qwen2_5_based.modeling_qwen2_5_vl import (
     apply_multimodal_rotary_pos_emb,
 )
 from flash_attn import flash_attn_func
-from transformers.modeling_flash_attention_utils import (
-    is_flash_attn_greater_or_equal_2_10,
-)
+from transformers.utils import is_flash_attn_greater_or_equal_2_10
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLRotaryEmbedding,
     repeat_kv,
@@ -195,7 +193,15 @@ class JointQwen2VLAttention(nn.Module):
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
             else:
-                past_key_states, past_value_states = past_key_value[self.layer_idx]
+                if hasattr(past_key_value, "key_cache"):
+                    past_key_states = past_key_value.key_cache[self.layer_idx]
+                    past_value_states = past_key_value.value_cache[self.layer_idx]
+                elif hasattr(past_key_value, "layers"):
+                    past_layer = past_key_value.layers[self.layer_idx]
+                    past_key_states = past_layer.keys
+                    past_value_states = past_layer.values
+                else:
+                    past_key_states, past_value_states = past_key_value[self.layer_idx]
                 key_states = torch.cat([past_key_states, key_states], dim=-2)
                 value_states = torch.cat([past_value_states, value_states], dim=-2)
 

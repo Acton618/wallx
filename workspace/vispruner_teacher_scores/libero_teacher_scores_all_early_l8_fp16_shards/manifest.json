@@ -1,0 +1,142 @@
+{
+  "meta": {
+    "repo_id": "libero_all",
+    "dataset_root": "/root/autodl-tmp/wall_x/datasheet/libero_all",
+    "image_key": "observation.images.faceImg",
+    "model_path": "/root/autodl-tmp/wall_x/pretrained/wall-oss-fast",
+    "strategy": "topk_attention",
+    "keep_ratio": 0.5,
+    "feature_source": "early_hidden",
+    "early_layer": 8,
+    "feature_dtype": "float16",
+    "save_image_embeds": false,
+    "dataset_size": 271772,
+    "num_records": 30000,
+    "actual_saved_records": 30000,
+    "num_shards": 15,
+    "dataset_index_ranges": [
+      [
+        0,
+        1999
+      ],
+      [
+        2000,
+        3999
+      ],
+      [
+        4000,
+        5999
+      ],
+      [
+        6000,
+        7999
+      ],
+      [
+        8000,
+        9999
+      ],
+      [
+        10000,
+        11999
+      ],
+      [
+        12000,
+        13999
+      ],
+      [
+        14000,
+        15999
+      ],
+      [
+        16000,
+        17999
+      ],
+      [
+        18000,
+        19999
+      ],
+      [
+        20000,
+        21999
+      ],
+      [
+        22000,
+        23999
+      ],
+      [
+        24000,
+        25999
+      ],
+      [
+        26000,
+        27999
+      ],
+      [
+        28000,
+        29999
+      ]
+    ]
+  },
+  "shards": [
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00000_0000000_0001999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00001_0002000_0003999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00002_0004000_0005999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00003_0006000_0007999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00004_0008000_0009999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00005_0010000_0011999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00006_0012000_0013999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00007_0014000_0015999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00008_0016000_0017999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00009_0018000_0019999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00010_0020000_0021999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00011_0022000_0023999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00012_0024000_0025999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00013_0026000_0027999.pt",
+      "records": 2000
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/libero_teacher_scores_all_early_l8_fp16_shards/teacher_scores_shard_00014_0028000_0029999.pt",
+      "records": 2000
+    }
+  ]
+}

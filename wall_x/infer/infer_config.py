@@ -577,7 +577,7 @@ class InferConfig:
         if not (
             getattr(self.model_config, "vispruner_enable", False)
             and getattr(self.model_config, "vispruner_strategy", "original")
-            != "original"
+            == "topk_attention"
             and getattr(self.model_config, "vispruner_force_vision_eager", True)
         ):
             self.model_config.vision_config._attn_implementation = "flash_attention_2"

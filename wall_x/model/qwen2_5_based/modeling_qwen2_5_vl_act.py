@@ -36,6 +36,7 @@ from transformers.modeling_outputs import (
 
 from wall_x.fusions import ops
 from wall_x.model.action_head import ActionProcessor
+from wall_x.model.vispruner_score_predictor import load_token_score_predictor
 from wall_x.model.vispruner_token_pruner import WallXVisPruner
 from wall_x.model.qwen2_5_based.configuration_qwen2_5_vl import Qwen2_5_VLConfig
 from wall_x.model.model_utils import (
@@ -853,7 +854,7 @@ class Qwen2_5_VLMoEForAction(
     and optional LoRA fine-tuning support.
     """
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     config_class = Qwen2_5_VLConfig
     _no_split_modules = ["Qwen2_5_VLDecoderLayer_with_MoE", "Qwen2_5_VLVisionBlock"]
 
@@ -1021,7 +1022,7 @@ class Qwen2_5_VLMoEForAction(
         """
         if (
             getattr(config, "vispruner_enable", False)
-            and getattr(config, "vispruner_strategy", "original") != "original"
+            and getattr(config, "vispruner_strategy", "original") == "topk_attention"
             and getattr(config, "vispruner_force_vision_eager", True)
         ):
             config.vision_config._attn_implementation = "eager"
@@ -1040,6 +1041,7 @@ class Qwen2_5_VLMoEForAction(
         # Initialize loss function without reduction for channel-wise loss computation
         self.loss_fct = CrossEntropyLoss(reduction="none")
         self.vispruner = WallXVisPruner(config)
+        self.vispruner_score_predictor = None
         self.flow_loss_weight = flow_loss_weight
         self.use_fast_tokenizer = use_fast_tokenizer
         self.processor = processor
@@ -1065,6 +1067,7 @@ class Qwen2_5_VLMoEForAction(
 
         # Initialize weights and apply final processing
         self.post_init()
+        self.vispruner_score_predictor = self._build_vispruner_score_predictor()
 
     def define_action_token_id(self):
         """
@@ -1150,6 +1153,78 @@ class Qwen2_5_VLMoEForAction(
             and self.vispruner.enabled
         )
 
+    def _build_vispruner_score_predictor(self):
+        strategy = str(getattr(self.config, "vispruner_strategy", "original"))
+        if strategy not in {"predictor_score", "predictor_early"}:
+            return None
+
+        source = str(getattr(self.config, "vispruner_predictor_source", "image_embeds"))
+        if source not in {"image_embeds", "patch_embeds", "early_hidden"}:
+            raise ValueError(
+                "vispruner_predictor_source must be one of 'image_embeds', "
+                "'patch_embeds', or 'early_hidden'."
+            )
+        if strategy == "predictor_early" and source == "image_embeds":
+            raise ValueError(
+                "vispruner strategy 'predictor_early' requires "
+                "vispruner_predictor_source='early_hidden' or 'patch_embeds'. "
+                "Use strategy='predictor_score' for post-vision predictor scoring."
+            )
+
+        checkpoint_path = getattr(self.config, "vispruner_predictor_path", None)
+        if not checkpoint_path:
+            raise ValueError(
+                f"vispruner strategy '{strategy}' requires "
+                "vispruner_predictor_path / vispruner.predictor.checkpoint. "
+                "Use strategy='topk_attention' to keep the original pruning path."
+            )
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(
+                f"VisPruner predictor checkpoint not found: {checkpoint_path}"
+            )
+
+        if source == "image_embeds":
+            default_input_dim = getattr(
+                self.config.vision_config, "out_hidden_size", None
+            )
+            if default_input_dim is None:
+                default_input_dim = getattr(self.config.vision_config, "hidden_size")
+        else:
+            default_input_dim = getattr(self.config.vision_config, "hidden_size")
+        default_input_dim = int(default_input_dim)
+        predictor = load_token_score_predictor(
+            checkpoint_path=checkpoint_path,
+            default_input_dim=default_input_dim,
+            default_hidden_dim=getattr(
+                self.config, "vispruner_predictor_hidden_dim", None
+            ),
+            default_dropout=float(
+                getattr(self.config, "vispruner_predictor_dropout", 0.0)
+            ),
+            strict=bool(getattr(self.config, "vispruner_predictor_strict_load", True)),
+        )
+        predictor.eval()
+        for param in predictor.parameters():
+            param.requires_grad_(False)
+        return predictor
+
+    def _predict_vispruner_scores(self, image_embeds):
+        if self.vispruner_score_predictor is None:
+            raise RuntimeError(
+                "vispruner_score_predictor is not initialized. "
+                "Check vispruner_predictor_path and vispruner_strategy."
+            )
+        predictor = self.vispruner_score_predictor
+        if image_embeds.shape[-1] != predictor.input_dim:
+            raise ValueError(
+                f"Predictor input_dim ({predictor.input_dim}) does not match "
+                f"image_embeds dim ({image_embeds.shape[-1]})."
+            )
+        predictor = predictor.to(device=image_embeds.device, dtype=image_embeds.dtype)
+        predictor.eval()
+        with torch.no_grad():
+            return predictor(image_embeds)
+
     def _pad_token_id(self) -> int:
         if self.config.pad_token_id is not None:
             return self.config.pad_token_id
@@ -1207,13 +1282,87 @@ class Qwen2_5_VLMoEForAction(
             perf_timer.stop("image_cast")
 
         if self._should_prune_images(pixel_values, image_grid_thw):
+            strategy = str(getattr(self.config, "vispruner_strategy", "original"))
+            image_keep_mask = None
+            if strategy == "topk_attention":
+                if perf_timer is not None:
+                    perf_timer.start("vision_image_encode_score")
+                image_embeds, image_scores = self.visual(
+                    pixel_values, grid_thw=image_grid_thw, output_attentions=True
+                )
+                if perf_timer is not None:
+                    perf_timer.stop("vision_image_encode_score")
+            elif strategy in {"predictor_score", "norm"}:
+                if perf_timer is not None:
+                    perf_timer.start("vision_image_encode")
+                predictor_features = None
+                if strategy == "predictor_score":
+                    image_embeds, predictor_features = self.visual(
+                        pixel_values,
+                        grid_thw=image_grid_thw,
+                        output_attentions=False,
+                        return_vispruner_features=True,
+                        vispruner_feature_source=str(
+                            getattr(
+                                self.config,
+                                "vispruner_predictor_source",
+                                "image_embeds",
+                            )
+                        ),
+                        vispruner_early_layer=getattr(
+                            self.config, "vispruner_predictor_early_layer", None
+                        ),
+                    )
+                else:
+                    image_embeds = self.visual(
+                        pixel_values, grid_thw=image_grid_thw, output_attentions=False
+                    )
+                if perf_timer is not None:
+                    perf_timer.stop("vision_image_encode")
+
+                image_scores = None
+                if strategy == "predictor_score":
+                    if perf_timer is not None:
+                        perf_timer.start("vispruner_predictor_score")
+                    image_scores = self._predict_vispruner_scores(predictor_features)
+                    if perf_timer is not None:
+                        perf_timer.stop("vispruner_predictor_score")
+            elif strategy == "predictor_early":
+                if perf_timer is not None:
+                    perf_timer.start("vision_image_encode_early_prune")
+                image_embeds, image_scores, image_keep_mask = self.visual(
+                    pixel_values,
+                    grid_thw=image_grid_thw,
+                    output_attentions=False,
+                    vispruner_early_prune=True,
+                    vispruner_score_predictor=self.vispruner_score_predictor,
+                    vispruner_feature_source=str(
+                        getattr(
+                            self.config,
+                            "vispruner_predictor_source",
+                            "early_hidden",
+                        )
+                    ),
+                    vispruner_early_layer=getattr(
+                        self.config, "vispruner_predictor_early_layer", None
+                    ),
+                    vispruner_keep_ratio=float(
+                        getattr(self.config, "vispruner_keep_ratio", 1.0)
+                    ),
+                    vispruner_min_tokens=int(
+                        getattr(self.config, "vispruner_min_tokens", 1)
+                    ),
+                )
+                if perf_timer is not None:
+                    perf_timer.stop("vision_image_encode_early_prune")
+            else:
+                raise ValueError(
+                    f"Unsupported vispruner strategy: {strategy}. "
+                    "Supported strategies are 'original', 'topk_attention', "
+                    "'predictor_score', 'predictor_early', and 'norm'."
+                )
+
             if perf_timer is not None:
-                perf_timer.start("vision_image_encode_score")
-            image_embeds, image_scores = self.visual(
-                pixel_values, grid_thw=image_grid_thw, output_attentions=True
-            )
-            if perf_timer is not None:
-                perf_timer.stop("vision_image_encode_score")
                 perf_timer.start("pruning_position_ids_prepare")
             position_ids = self._ensure_position_ids_for_pruning(
                 input_ids=input_ids,
@@ -1238,6 +1387,7 @@ class Qwen2_5_VLMoEForAction(
                 position_ids=position_ids,
                 pad_token_id=self._pad_token_id(),
                 perf_timer=perf_timer,
+                image_keep_mask=image_keep_mask,
             )
             if prune_result.rope_deltas is not None:
                 self.rope_deltas = prune_result.rope_deltas

@@ -165,7 +165,7 @@ def preprocesser_call(
     # Process image inputs
     if images is not None and len(images) > 0:
         image_inputs = processor.image_processor(
-            images=images, videos=None, return_tensors=return_tensors
+            images=images, return_tensors=return_tensors
         )
         image_grid_thw = image_inputs["image_grid_thw"]
     else:

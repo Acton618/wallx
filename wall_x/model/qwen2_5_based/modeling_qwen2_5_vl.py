@@ -610,11 +610,64 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
 
         return window_index, cu_window_seqlens
 
+    def _vispruner_image_lengths(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        return (
+            grid_thw[:, 0]
+            * (grid_thw[:, 1] // self.spatial_merge_size)
+            * (grid_thw[:, 2] // self.spatial_merge_size)
+        ).to(dtype=torch.long)
+
+    def _vispruner_keep_mask_from_scores(
+        self,
+        scores: torch.Tensor,
+        image_lengths: torch.Tensor,
+        keep_ratio: float,
+        min_tokens: int,
+    ) -> torch.Tensor:
+        keep_mask = torch.zeros(scores.shape[0], dtype=torch.bool, device=scores.device)
+        offset = 0
+        for length_tensor in image_lengths:
+            length = int(length_tensor.item())
+            keep_count = int(math.ceil(length * float(keep_ratio)))
+            keep_count = max(int(min_tokens), keep_count)
+            keep_count = min(length, keep_count)
+            local_scores = scores[offset : offset + length]
+            local_keep = torch.topk(local_scores, k=keep_count, largest=True).indices
+            keep_mask[offset + local_keep] = True
+            offset += length
+        return keep_mask
+
+    def _vispruner_pruned_cu_seqlens(
+        self,
+        keep_mask: torch.Tensor,
+        segment_lengths: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        counts = []
+        offset = 0
+        for length_tensor in segment_lengths:
+            length = int(length_tensor.item())
+            kept = int(keep_mask[offset : offset + length].sum().item())
+            if kept > 0:
+                counts.append(kept * self.spatial_merge_unit)
+            offset += length
+        if not counts:
+            raise ValueError("VisPruner early pruning removed all visual tokens.")
+        cu = torch.tensor([0] + counts, dtype=torch.int32, device=device).cumsum(dim=0)
+        return cu
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         grid_thw: torch.Tensor,
         output_attentions: bool = False,
+        return_vispruner_features: bool = False,
+        vispruner_feature_source: str = "image_embeds",
+        vispruner_early_layer: Optional[int] = None,
+        vispruner_early_prune: bool = False,
+        vispruner_score_predictor: Optional[nn.Module] = None,
+        vispruner_keep_ratio: float = 1.0,
+        vispruner_min_tokens: int = 1,
     ) -> torch.Tensor:
         """
         Args:
@@ -626,6 +679,33 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         Returns:
             `torch.Tensor`: hidden_states.
         """
+        if (
+            return_vispruner_features or vispruner_early_prune
+        ) and vispruner_feature_source not in {
+            "image_embeds",
+            "patch_embeds",
+            "early_hidden",
+        }:
+            raise ValueError(
+                "vispruner_feature_source must be one of "
+                "'image_embeds', 'patch_embeds', or 'early_hidden'."
+            )
+        if vispruner_early_prune:
+            if output_attentions:
+                raise ValueError(
+                    "vispruner_early_prune does not support output_attentions=True."
+                )
+            if vispruner_score_predictor is None:
+                raise ValueError(
+                    "vispruner_early_prune requires vispruner_score_predictor."
+                )
+            if vispruner_feature_source == "image_embeds":
+                raise ValueError(
+                    "vispruner_early_prune requires 'patch_embeds' or "
+                    "'early_hidden' features; 'image_embeds' is only available "
+                    "after the full vision tower."
+                )
+
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = ops.rot_pos_emb(
             self.rotary_pos_emb.inv_freq, grid_thw, self.spatial_merge_size
@@ -640,6 +720,14 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         )
 
         seq_len, _ = hidden_states.size()
+        original_num_groups = seq_len // self.spatial_merge_unit
+        vispruner_features = None
+        early_hidden_states = None
+        if return_vispruner_features and vispruner_feature_source == "patch_embeds":
+            vispruner_features = hidden_states.reshape(
+                seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+            ).mean(dim=1)
+
         hidden_states = hidden_states.reshape(
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
         )
@@ -652,6 +740,10 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
+        reverse_indices = torch.argsort(window_index)
+        final_reverse_indices = reverse_indices
+        vispruner_keep_mask = None
+        vispruner_scores = None
 
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
@@ -671,6 +763,67 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
 
         patch_score_sum = None
         patch_score_count = 0
+        early_layer = (
+            int(vispruner_early_layer)
+            if vispruner_early_layer is not None
+            else max(1, len(self.blocks) // 4)
+        )
+        if vispruner_early_prune and vispruner_feature_source == "patch_embeds":
+            patch_features = hidden_states.reshape(
+                original_num_groups, self.spatial_merge_unit, -1
+            ).mean(dim=1)[reverse_indices]
+            scorer = vispruner_score_predictor.to(
+                device=patch_features.device, dtype=patch_features.dtype
+            )
+            scorer.eval()
+            with torch.no_grad():
+                vispruner_scores = scorer(patch_features).detach().float()
+            image_lengths = self._vispruner_image_lengths(grid_thw).to(
+                vispruner_scores.device
+            )
+            vispruner_keep_mask = self._vispruner_keep_mask_from_scores(
+                vispruner_scores,
+                image_lengths,
+                vispruner_keep_ratio,
+                vispruner_min_tokens,
+            )
+            keep_mask_window = vispruner_keep_mask[window_index]
+            group_hidden = hidden_states.reshape(
+                original_num_groups, self.spatial_merge_unit, -1
+            )[keep_mask_window]
+            hidden_states = group_hidden.reshape(-1, group_hidden.shape[-1])
+            position_embeddings = tuple(
+                item.reshape(original_num_groups, self.spatial_merge_unit, -1)[
+                    keep_mask_window
+                ].reshape(-1, item.shape[-1])
+                for item in position_embeddings
+            )
+            kept_window_index = window_index[keep_mask_window]
+            final_reverse_indices = torch.argsort(kept_window_index)
+            cu_seqlens = self._vispruner_pruned_cu_seqlens(
+                vispruner_keep_mask,
+                image_lengths,
+                grid_thw.device,
+            )
+            window_lengths = (
+                (cu_window_seqlens[1:] - cu_window_seqlens[:-1])
+                // self.spatial_merge_unit
+            )
+            cu_window_seqlens = self._vispruner_pruned_cu_seqlens(
+                keep_mask_window,
+                window_lengths,
+                grid_thw.device,
+            )
+            max_seqlen_full = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+            max_seqlen_window = (
+                (cu_window_seqlens[1:] - cu_window_seqlens[:-1]).max().item()
+            )
+        if (
+            (return_vispruner_features or vispruner_early_prune)
+            and vispruner_feature_source == "early_hidden"
+            and early_layer <= 0
+        ):
+            early_hidden_states = hidden_states
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
@@ -706,6 +859,73 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
                 else:
                     hidden_states = block_outputs
 
+            if (
+                return_vispruner_features
+                and vispruner_feature_source == "early_hidden"
+                and early_hidden_states is None
+                and layer_num + 1 >= early_layer
+            ):
+                early_hidden_states = hidden_states
+
+            if (
+                vispruner_early_prune
+                and vispruner_feature_source == "early_hidden"
+                and vispruner_keep_mask is None
+                and layer_num + 1 >= early_layer
+            ):
+                # Experimental path: after the configured early layer, score
+                # LLM-level visual groups and run the remaining vision blocks
+                # only on the kept patch groups.
+                early_features = hidden_states.reshape(
+                    original_num_groups, self.spatial_merge_unit, -1
+                ).mean(dim=1)[reverse_indices]
+                scorer = vispruner_score_predictor.to(
+                    device=early_features.device, dtype=early_features.dtype
+                )
+                scorer.eval()
+                with torch.no_grad():
+                    vispruner_scores = scorer(early_features).detach().float()
+                image_lengths = self._vispruner_image_lengths(grid_thw).to(
+                    vispruner_scores.device
+                )
+                vispruner_keep_mask = self._vispruner_keep_mask_from_scores(
+                    vispruner_scores,
+                    image_lengths,
+                    vispruner_keep_ratio,
+                    vispruner_min_tokens,
+                )
+                keep_mask_window = vispruner_keep_mask[window_index]
+                group_hidden = hidden_states.reshape(
+                    original_num_groups, self.spatial_merge_unit, -1
+                )[keep_mask_window]
+                hidden_states = group_hidden.reshape(-1, group_hidden.shape[-1])
+                position_embeddings = tuple(
+                    item.reshape(original_num_groups, self.spatial_merge_unit, -1)[
+                        keep_mask_window
+                    ].reshape(-1, item.shape[-1])
+                    for item in position_embeddings
+                )
+                kept_window_index = window_index[keep_mask_window]
+                final_reverse_indices = torch.argsort(kept_window_index)
+                cu_seqlens = self._vispruner_pruned_cu_seqlens(
+                    vispruner_keep_mask,
+                    image_lengths,
+                    grid_thw.device,
+                )
+                window_lengths = (
+                    (cu_window_seqlens[1:] - cu_window_seqlens[:-1])
+                    // self.spatial_merge_unit
+                )
+                cu_window_seqlens = self._vispruner_pruned_cu_seqlens(
+                    keep_mask_window,
+                    window_lengths,
+                    grid_thw.device,
+                )
+                max_seqlen_full = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+                max_seqlen_window = (
+                    (cu_window_seqlens[1:] - cu_window_seqlens[:-1]).max().item()
+                )
+
         merged_scores = None
         if output_attentions and patch_score_sum is not None and patch_score_count > 0:
             patch_scores = patch_score_sum / patch_score_count
@@ -714,14 +934,52 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
             ).mean(dim=1)
 
         hidden_states = self.merger(hidden_states)
-        reverse_indices = torch.argsort(window_index)
-        hidden_states = hidden_states[reverse_indices, :]
+        hidden_states = hidden_states[final_reverse_indices, :]
         if merged_scores is not None:
             merged_scores = merged_scores[reverse_indices]
 
+        if vispruner_early_prune:
+            if vispruner_keep_mask is None:
+                raise ValueError(
+                    f"vispruner_early_layer={early_layer} exceeds vision depth "
+                    f"{len(self.blocks)}."
+                )
+            return hidden_states, vispruner_scores, vispruner_keep_mask
+
+        if return_vispruner_features:
+            if vispruner_feature_source == "image_embeds":
+                vispruner_features = hidden_states
+            elif vispruner_feature_source == "early_hidden":
+                if early_hidden_states is None:
+                    raise ValueError(
+                        f"vispruner_early_layer={early_layer} exceeds vision depth "
+                        f"{len(self.blocks)}."
+                    )
+                vispruner_features = early_hidden_states.reshape(
+                    seq_len // self.spatial_merge_unit,
+                    self.spatial_merge_unit,
+                    -1,
+                ).mean(dim=1)
+                vispruner_features = vispruner_features[reverse_indices]
+
         if output_attentions:
+            if return_vispruner_features:
+                return hidden_states, merged_scores, vispruner_features
             return hidden_states, merged_scores
+        if return_vispruner_features:
+            return hidden_states, vispruner_features
         return hidden_states
+
+
+def _compute_default_rope_parameters(config, device=None, seq_len=None, **rope_kwargs):
+    base = getattr(config, "rope_theta", 10000.0)
+    dim = getattr(config, "head_dim", None)
+    if dim is None:
+        dim = config.hidden_size // config.num_attention_heads
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+    )
+    return inv_freq, 1.0
 
 
 class Qwen2_5_VLRotaryEmbedding(nn.Module):
@@ -738,7 +996,9 @@ class Qwen2_5_VLRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS.get(
+            self.rope_type, _compute_default_rope_parameters
+        )
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -1179,7 +1439,15 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
             else:
-                past_key_states, past_value_states = past_key_value[self.layer_idx]
+                if hasattr(past_key_value, "key_cache"):
+                    past_key_states = past_key_value.key_cache[self.layer_idx]
+                    past_value_states = past_key_value.value_cache[self.layer_idx]
+                elif hasattr(past_key_value, "layers"):
+                    past_layer = past_key_value.layers[self.layer_idx]
+                    past_key_states = past_layer.keys
+                    past_value_states = past_layer.values
+                else:
+                    past_key_states, past_value_states = past_key_value[self.layer_idx]
                 key_states = torch.cat([past_key_states, key_states], dim=-2)
                 value_states = torch.cat([past_value_states, value_states], dim=-2)
 
@@ -1812,7 +2080,7 @@ QWEN2_5_VL_INPUTS_DOCSTRING = r"""
 
 
 class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     config_class = Qwen2_5_VLConfig
     _no_split_modules = ["Qwen2_5_VLDecoderLayer", "Qwen2_5_VLVisionBlock"]
 

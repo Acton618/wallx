@@ -51,10 +51,87 @@ def apply_vispruner_config(train_config, model_config):
             ),
         )
     )
+    predictor_config = vispruner_config.get("predictor", {}) or {}
+    model_config.vispruner_predictor_path = predictor_config.get(
+        "checkpoint",
+        vispruner_config.get(
+            "predictor_path",
+            train_config.get(
+                "vispruner_predictor_path",
+                getattr(model_config, "vispruner_predictor_path", None),
+            ),
+        ),
+    )
+    model_config.vispruner_predictor_source = str(
+        predictor_config.get(
+            "source",
+            vispruner_config.get(
+                "predictor_source",
+                train_config.get(
+                    "vispruner_predictor_source",
+                    getattr(
+                        model_config,
+                        "vispruner_predictor_source",
+                        "image_embeds",
+                    ),
+                ),
+            ),
+        )
+    )
+    early_layer = predictor_config.get(
+        "early_layer",
+        vispruner_config.get(
+            "predictor_early_layer",
+            train_config.get(
+                "vispruner_predictor_early_layer",
+                getattr(model_config, "vispruner_predictor_early_layer", None),
+            ),
+        ),
+    )
+    model_config.vispruner_predictor_early_layer = (
+        int(early_layer) if early_layer is not None else None
+    )
+    hidden_dim = predictor_config.get(
+        "hidden_dim",
+        vispruner_config.get(
+            "predictor_hidden_dim",
+            train_config.get(
+                "vispruner_predictor_hidden_dim",
+                getattr(model_config, "vispruner_predictor_hidden_dim", None),
+            ),
+        ),
+    )
+    model_config.vispruner_predictor_hidden_dim = (
+        int(hidden_dim) if hidden_dim is not None else None
+    )
+    model_config.vispruner_predictor_dropout = float(
+        predictor_config.get(
+            "dropout",
+            vispruner_config.get(
+                "predictor_dropout",
+                train_config.get(
+                    "vispruner_predictor_dropout",
+                    getattr(model_config, "vispruner_predictor_dropout", 0.0),
+                ),
+            ),
+        )
+    )
+    model_config.vispruner_predictor_strict_load = bool(
+        predictor_config.get(
+            "strict_load",
+            vispruner_config.get(
+                "predictor_strict_load",
+                train_config.get(
+                    "vispruner_predictor_strict_load",
+                    getattr(model_config, "vispruner_predictor_strict_load", True),
+                ),
+            ),
+        )
+    )
 
     if (
         model_config.vispruner_enable
-        and model_config.vispruner_strategy != "original"
+        and model_config.vispruner_strategy == "topk_attention"
         and model_config.vispruner_force_vision_eager
     ):
         model_config.vision_config._attn_implementation = "eager"

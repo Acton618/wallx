@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "repo_id": "libero_all",
+    "dataset_root": "/root/autodl-tmp/wall_x/datasheet/libero_all",
+    "image_key": "observation.images.faceImg",
+    "model_path": "/root/autodl-tmp/wall_x/pretrained/wall-oss-fast",
+    "strategy": "topk_attention",
+    "keep_ratio": 0.5,
+    "feature_source": "early_hidden",
+    "early_layer": 8,
+    "feature_dtype": "float16",
+    "save_image_embeds": false,
+    "dataset_size": 271772,
+    "num_records": 10
+  },
+  "shards": [
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/shard_smoke/teacher_scores_shard_00000_0000000_0000003.pt",
+      "records": 4
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/shard_smoke/teacher_scores_shard_00001_0000004_0000007.pt",
+      "records": 4
+    },
+    {
+      "path": "/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/shard_smoke/teacher_scores_shard_00002_0000008_0000009.pt",
+      "records": 2
+    }
+  ]
+}

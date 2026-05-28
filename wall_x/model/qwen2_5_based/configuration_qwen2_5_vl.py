@@ -192,6 +192,7 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         sliding_window=4096,
         max_window_layers=80,
         attention_dropout=0.0,
+        pad_token_id=151643,
         vision_config=None,
         rope_scaling=None,
         num_experts=4,
@@ -218,6 +219,12 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         vispruner_keep_ratio=1.0,
         vispruner_min_tokens=1,
         vispruner_force_vision_eager=True,
+        vispruner_predictor_path=None,
+        vispruner_predictor_source="image_embeds",
+        vispruner_predictor_early_layer=None,
+        vispruner_predictor_hidden_dim=None,
+        vispruner_predictor_dropout=0.0,
+        vispruner_predictor_strict_load=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -270,6 +277,12 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         self.vispruner_keep_ratio = vispruner_keep_ratio
         self.vispruner_min_tokens = vispruner_min_tokens
         self.vispruner_force_vision_eager = vispruner_force_vision_eager
+        self.vispruner_predictor_path = vispruner_predictor_path
+        self.vispruner_predictor_source = vispruner_predictor_source
+        self.vispruner_predictor_early_layer = vispruner_predictor_early_layer
+        self.vispruner_predictor_hidden_dim = vispruner_predictor_hidden_dim
+        self.vispruner_predictor_dropout = vispruner_predictor_dropout
+        self.vispruner_predictor_strict_load = vispruner_predictor_strict_load
 
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
@@ -282,7 +295,11 @@ class Qwen2_5_VLConfig(PretrainedConfig):
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         rope_config_validation(self, ignore_keys={"mrope_section"})
 
-        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+        super().__init__(
+            pad_token_id=pad_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )
 
         # move vision config initialization after super init to avoid recursively set in latest transformers version
         # TODO: make it better
