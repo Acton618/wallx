@@ -9,17 +9,33 @@ from torchdiffeq import odeint
 from dataclasses import dataclass
 from torch.nn import CrossEntropyLoss
 from safetensors.torch import load_file
+import transformers as _wallx_transformers
+try:
+    from transformers.cache_utils import EncoderDecoderCache as _WallXEncoderDecoderCache
+except Exception:
+    from transformers.cache_utils import DynamicCache as _WallXEncoderDecoderCache
+    if not hasattr(_wallx_transformers, "EncoderDecoderCache"):
+        _wallx_transformers.EncoderDecoderCache = _WallXEncoderDecoderCache
+
 from peft import LoraConfig, get_peft_model
 from typing import Optional, List, Tuple, Any, Dict, Union
 import time
 from transformers import AutoConfig, AutoProcessor
-from transformers.utils import logging, is_torchdynamo_compiling
-from transformers.cache_utils import (
-    Cache,
-    DynamicCache,
-    SlidingWindowCache,
-    StaticCache,
-)
+from transformers.utils import logging
+try:
+    from transformers.utils import is_torchdynamo_compiling
+except ImportError:
+    def is_torchdynamo_compiling():
+        return False
+from transformers.cache_utils import Cache, DynamicCache
+try:
+    from transformers.cache_utils import SlidingWindowCache
+except ImportError:
+    SlidingWindowCache = DynamicCache
+try:
+    from transformers.cache_utils import StaticCache
+except ImportError:
+    StaticCache = DynamicCache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 
 from wall_x.model.qwen2_5_based.modeling_qwen2_5_vl import (

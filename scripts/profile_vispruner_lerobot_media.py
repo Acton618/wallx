@@ -63,6 +63,15 @@ def load_model(args, enable_pruning: bool):
         args.model_path,
         train_config=build_train_config(args, enable_pruning),
     )
+    if args.image_min_pixels is not None:
+        model.processor.image_processor.min_pixels = int(args.image_min_pixels)
+    if args.image_max_pixels is not None:
+        model.processor.image_processor.max_pixels = int(args.image_max_pixels)
+    if args.image_min_pixels is not None or args.image_max_pixels is not None:
+        model.processor.image_processor.size = {
+            "shortest_edge": model.processor.image_processor.min_pixels,
+            "longest_edge": model.processor.image_processor.max_pixels,
+        }
     model.eval()
     model = model.to(args.device)
     if args.device.startswith("cuda"):
@@ -481,6 +490,8 @@ def write_outputs(args, records, counts):
         f"- predictor_checkpoint: `{args.predictor_checkpoint}`",
         f"- predictor_source: `{args.predictor_source}`",
         f"- predictor_early_layer: `{args.predictor_early_layer}`",
+        f"- image_min_pixels: `{args.image_min_pixels}`",
+        f"- image_max_pixels: `{args.image_max_pixels}`",
         f"- device: `{args.device}`",
         "",
         "> Note: current VisPruner hard-pruning is wired to image tokens only. "
@@ -536,6 +547,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--keep-ratio", type=float, default=0.5)
+    parser.add_argument("--image-min-pixels", type=int, default=None)
+    parser.add_argument("--image-max-pixels", type=int, default=None)
     parser.add_argument(
         "--pruned-strategy",
         default="topk_attention",

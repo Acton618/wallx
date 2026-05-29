@@ -3,6 +3,7 @@ import os
 import numpy as np
 from transformers import AutoProcessor
 from wall_x.model.action_head import Normalizer
+from wall_x.model.ode_distill_utils import get_ode_distill_config
 
 
 def apply_vispruner_config(train_config, model_config):
@@ -155,6 +156,11 @@ def update_model_config(train_config, model_config):
         model_config._attn_implementation = train_config["_attn_implementation"]
 
     model_config = apply_vispruner_config(train_config, model_config)
+    ode_distill_config = get_ode_distill_config(train_config)
+    model_config.ode_distill_enable = bool(ode_distill_config.get("enable", False))
+    model_config.ode_distill_student_num_inference_timesteps = int(
+        ode_distill_config.get("student_num_inference_timesteps", 4)
+    )
 
     return model_config
 

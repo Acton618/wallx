@@ -1,0 +1,6 @@
+{
+  "epoch": 3,
+  "global_step": 15000,
+  "train_samples": 5000,
+  "val_samples": 1000
+}

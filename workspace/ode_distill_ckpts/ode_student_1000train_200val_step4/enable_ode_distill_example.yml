@@ -1,0 +1,13 @@
+ode_distill:
+  enable: true
+  student_checkpoint_path: /root/autodl-tmp/wall_x/workspace/ode_distill_ckpts/ode_student_1000train_200val_step4
+  teacher_num_inference_timesteps: 10
+  student_num_inference_timesteps: 4
+  lora:
+    enable: true
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - v_proj

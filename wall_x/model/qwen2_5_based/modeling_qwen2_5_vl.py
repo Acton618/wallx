@@ -7,12 +7,15 @@ from torch.nn import CrossEntropyLoss
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from transformers.activations import ACT2FN
-from transformers.cache_utils import (
-    Cache,
-    DynamicCache,
-    SlidingWindowCache,
-    StaticCache,
-)
+from transformers.cache_utils import Cache, DynamicCache
+try:
+    from transformers.cache_utils import SlidingWindowCache
+except ImportError:
+    SlidingWindowCache = DynamicCache
+try:
+    from transformers.cache_utils import StaticCache
+except ImportError:
+    StaticCache = DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
@@ -23,10 +26,14 @@ from transformers.utils import (
     add_start_docstrings_to_model_forward,
     is_flash_attn_2_available,
     is_flash_attn_greater_or_equal_2_10,
-    is_torchdynamo_compiling,
     logging,
     replace_return_docstrings,
 )
+try:
+    from transformers.utils import is_torchdynamo_compiling
+except ImportError:
+    def is_torchdynamo_compiling():
+        return False
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 from wall_x.fusions import ops
 

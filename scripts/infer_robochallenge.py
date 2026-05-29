@@ -13,6 +13,7 @@ from qwen_vl_utils.vision_process import smart_resize
 from transformers import BatchFeature, AutoProcessor
 
 from wall_x.model.action_head import Normalizer
+from wall_x.model.ode_distill_utils import apply_ode_distill_checkpoint, get_ode_distill_config
 from wall_x.utils.constant import action_statistic_dof as default_action_statistic_dof
 from numba import jit, prange
 
@@ -496,6 +497,16 @@ class WallxModelWrapper:
         model.set_normalizer(
             copy.deepcopy(self.normalizer_action), copy.deepcopy(self.normalizer_propri)
         )
+        self.ode_distill_config = get_ode_distill_config(config)
+        if self.ode_distill_config.get("enable", False):
+            model, self.ode_distill_config = apply_ode_distill_checkpoint(
+                model, config, is_trainable=False
+            )
+            print(
+                "[ODE_DISTILL] enabled, student_num_inference_timesteps",
+                self.ode_distill_config.get("student_num_inference_timesteps"),
+                flush=True,
+            )
         model.to(device)
         model.to_bfloat16_for_selected_params()
 
@@ -1049,9 +1060,16 @@ class WallxModelWrapper:
         inputs,
         last_action_chunk=None,
         max_guidance_weight=20.0,
-        num_inference_timesteps=10,
+        num_inference_timesteps=None,
         sigma_action=0.2,
     ):
+        if num_inference_timesteps is None:
+            if getattr(self, "ode_distill_config", {}).get("enable", False):
+                num_inference_timesteps = int(
+                    self.ode_distill_config.get("student_num_inference_timesteps", 4)
+                )
+            else:
+                num_inference_timesteps = 10
         model_action_dim = sum(self.dof_config.values())
         if last_action_chunk is None:
             output = self.model.generate_flow_action(

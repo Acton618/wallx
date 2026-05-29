@@ -41,6 +41,21 @@ vispruner:
   min_tokens: 1
   force_vision_eager: true
 
+# ODE distillation student switch. Disabled by default to keep original Wall-X inference.
+ode_distill:
+  enable: false
+  student_checkpoint_path: null
+  teacher_num_inference_timesteps: 10
+  student_num_inference_timesteps: 4
+  lora:
+    enable: true
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - v_proj
+
 # Robot configuration - Define degrees of freedom for each component
 dof_config:
   follow_left_ee_cartesian_pos: 3      # Left end-effector Cartesian position

@@ -7,13 +7,27 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from wall_x.fusions import ops
 
+import transformers as _wallx_transformers
+try:
+    from transformers.cache_utils import EncoderDecoderCache as _WallXEncoderDecoderCache
+except Exception:
+    from transformers.cache_utils import DynamicCache as _WallXEncoderDecoderCache
+    if not hasattr(_wallx_transformers, "EncoderDecoderCache"):
+        _wallx_transformers.EncoderDecoderCache = _WallXEncoderDecoderCache
+
 from peft import LoraConfig, get_peft_model
 from typing import Optional, Union, Dict
 from packaging import version
 
 from transformers import GenerationMixin
 from transformers.activations import ACT2FN
-from transformers.modeling_utils import AttentionInterface
+try:
+    from transformers.modeling_utils import AttentionInterface
+except ImportError:
+    class AttentionInterface(dict):
+        def valid_keys(self):
+            return list(self.keys())
+
 
 from transformers.utils import logging, is_torch_xla_available
 

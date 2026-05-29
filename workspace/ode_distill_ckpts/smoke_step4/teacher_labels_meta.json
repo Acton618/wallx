@@ -1,0 +1,24 @@
+{
+  "items": [
+    {
+      "split": "train",
+      "local_index": 0,
+      "dataset_index": 0,
+      "source": "dataset_index=0 image_key=observation.images.faceImg"
+    },
+    {
+      "split": "train",
+      "local_index": 1,
+      "dataset_index": 135885,
+      "source": "dataset_index=135885 image_key=observation.images.faceImg"
+    },
+    {
+      "split": "val",
+      "local_index": 2,
+      "dataset_index": 271771,
+      "source": "dataset_index=271771 image_key=observation.images.faceImg"
+    }
+  ],
+  "teacher_num_inference_timesteps": 10,
+  "elapsed_sec": 1.261104746023193
+}
