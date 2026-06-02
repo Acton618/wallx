@@ -85,47 +85,114 @@ class PreprocessedDataset(Dataset[T_co]):
         self._cam_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]["camera"]
         self._state_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]
         self._action_key_mapping = KEY_MAPPINGS[self.hf_dataset.meta.repo_id]
+        self.media_type = self.dataload_config.get("media_type", "image")
+        if self.media_type not in {"image", "video"}:
+            raise ValueError(
+                f"Unsupported media_type={self.media_type!r}; "
+                "expected 'image' or 'video'."
+            )
+        # V1 video path: keep prompt placeholders and media tensors in the same camera order.
+        self._camera_keys = [
+            key
+            for key in self.hf_dataset.meta.camera_keys
+            if key in self._cam_key_mapping
+        ]
+        if not self._camera_keys:
+            raise ValueError(
+                f"No mapped camera keys found for repo {self.hf_dataset.meta.repo_id!r}."
+            )
+
+    def _resize_pil_image(self, img_pil, cam_key):
+        orig_width, orig_height = img_pil.size
+        target_size = self.data_config.resolution.get(
+            self._cam_key_mapping[cam_key], -1
+        )
+        if target_size != -1:
+            if orig_width > orig_height:
+                new_width = target_size
+                new_height = int(target_size * orig_height / orig_width)
+            else:
+                new_height = target_size
+                new_width = int(target_size * orig_width / orig_height)
+            img_pil = img_pil.resize((new_width, new_height))
+
+        current_width, current_height = img_pil.size
+        resized_height, resized_width = smart_resize(
+            current_height,
+            current_width,
+            factor=self.data_config.image_factor,
+            min_pixels=self.data_config.min_pixels,
+            max_pixels=self.data_config.max_pixels,
+        )
+        resized_img = img_pil.resize((resized_width, resized_height))
+        return resized_img, orig_height, orig_width, resized_height, resized_width
+
+    @staticmethod
+    def _tensor_frame_to_pil(frame):
+        from PIL import Image
+
+        frame = frame.detach().cpu()
+        if frame.ndim != 3:
+            raise ValueError(f"Expected a 3D frame tensor, got shape {tuple(frame.shape)}")
+        if frame.shape[0] in {1, 3, 4}:
+            frame = frame.permute(1, 2, 0)
+        if frame.dtype != torch.uint8:
+            frame = (frame.clamp(0, 1) * 255).to(torch.uint8)
+        return Image.fromarray(frame.numpy()).convert("RGB")
 
     def _vision_preprocess(self, frames):
         processed_frames = []
-        for key in self.hf_dataset.meta.camera_keys:
-            from PIL import Image
-
-            current_obs = frames[key].clone().permute(1, 2, 0)
-
-            img_pil = Image.fromarray((current_obs * 255).to(torch.uint8).cpu().numpy())
-            orig_width, orig_height = img_pil.size
-            # 2. Apply resolution constraints (if config is not -1)
-            target_size = self.data_config.resolution.get(
-                self._cam_key_mapping[key], -1
+        for key in self._camera_keys:
+            img_pil = self._tensor_frame_to_pil(frames[key].clone())
+            resized_img, orig_height, orig_width, resized_height, resized_width = (
+                self._resize_pil_image(img_pil, key)
             )
-            if target_size != -1:
-                # Maintain aspect ratio logic
-                if orig_width > orig_height:  # Landscape image
-                    new_width = target_size
-                    new_height = int(target_size * orig_height / orig_width)
-                else:  # Portrait image
-                    new_height = target_size
-                    new_width = int(target_size * orig_width / orig_height)
-                img_pil = img_pil.resize((new_width, new_height))
-
-            # 3. Apply smart scaling (qwen logic)
-            current_width, current_height = img_pil.size
-            resized_height, resized_width = smart_resize(
-                current_height,
-                current_width,
-                factor=self.data_config.image_factor,
-                min_pixels=self.data_config.min_pixels,
-                max_pixels=self.data_config.max_pixels,
-            )
-            resized_img = img_pil.resize((resized_width, resized_height))
             processed_frames.append(resized_img)
 
         return processed_frames, orig_height, orig_width, resized_height, resized_width
 
+    def _video_preprocess(self, frames):
+        """V1 video path: convert each camera window to one ordered video clip."""
+        processed_videos = []
+        first_shape = None
+        last_resize = None
+
+        for key in self._camera_keys:
+            video_tensor = frames[key]
+            if video_tensor.ndim == 3:
+                # Single-frame fallback keeps video mode robust for datasets without camera deltas.
+                video_tensor = video_tensor.unsqueeze(0)
+            if video_tensor.ndim != 4:
+                raise ValueError(
+                    f"Expected camera {key!r} to be [T,C,H,W] or [C,H,W], "
+                    f"got shape {tuple(video_tensor.shape)}"
+                )
+
+            clip = []
+            for frame in video_tensor:
+                img_pil = self._tensor_frame_to_pil(frame)
+                resized_img, orig_h, orig_w, resize_h, resize_w = self._resize_pil_image(
+                    img_pil, key
+                )
+                if first_shape is None:
+                    first_shape = (orig_h, orig_w)
+                last_resize = (resize_h, resize_w)
+                clip.append(np.array(resized_img))
+            processed_videos.append(clip)
+
+        if first_shape is None or last_resize is None:
+            raise ValueError("No camera frames were available for video preprocessing.")
+
+        orig_h, orig_w = first_shape
+        resize_h, resize_w = last_resize
+        return processed_videos, orig_h, orig_w, resize_h, resize_w
+
     def __getitem__(self, index):
         data = self._dataset[index]
-        image_inputs, h, w, resize_h, resize_w = self._vision_preprocess(data)
+        if self.media_type == "video":
+            video_inputs, h, w, resize_h, resize_w = self._video_preprocess(data)
+        else:
+            image_inputs, h, w, resize_h, resize_w = self._vision_preprocess(data)
         agent_pos = data[self._state_key_mapping["state"]]
         action = data[self._action_key_mapping["action"]]
         frame_index = data["frame_index"]
@@ -137,19 +204,23 @@ class PreprocessedDataset(Dataset[T_co]):
             self.dataload_config.get("action_horizon", 33) - 1,
             frame_index,
             self.data_config.priority_order,
-            self._cam_key_mapping,
+            {key: self._cam_key_mapping[key] for key in self._camera_keys},
             generate_subtask_ratio=generate_subtask_ratio,
+            media_type=self.media_type,
         )
         text = process_grounding_points(
             complete_text, h, w, resize_h, resize_w, self.data_config.model_type
         )
         result = {
-            "image_inputs": image_inputs,
             "text": text,
             "action": action,
             "agent_pos": agent_pos,
             "frame_index": frame_index,
         }
+        if self.media_type == "video":
+            result["video_inputs"] = video_inputs
+        else:
+            result["image_inputs"] = image_inputs
 
         return result
 
@@ -402,6 +473,11 @@ class DataCollator:
                 additional_inputs["image_inputs"] = [
                     item["image_inputs"] for item in batch
                 ]
+            elif key == "video_inputs":
+                # V1 video path: batch keeps one ordered clip per camera placeholder.
+                additional_inputs["video_inputs"] = [
+                    item["video_inputs"] for item in batch
+                ]
             elif key == "text":
                 additional_inputs["text"] = [item["text"] for item in batch]
             elif key == "frame_index":
@@ -424,13 +500,23 @@ class DataCollator:
         inputs = preprocesser_call(
             processor=self.processor,
             text=additional_inputs.pop("text"),
-            images=additional_inputs.pop("image_inputs"),
-            videos=None,
+            images=additional_inputs.pop("image_inputs", None),
+            videos=additional_inputs.pop("video_inputs", None),
             padding=True,
             truncation=True,
             return_tensors="pt",
             max_length=self.dataload_config.get("max_length", 768),
         )
+
+        # V1 video path: make temporal RoPE explicit when video_stride is configured.
+        if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None:
+            seconds_per_grid = self.dataload_config.get("video_seconds_per_grid", None)
+            if seconds_per_grid is not None and "second_per_grid_ts" not in inputs:
+                inputs["second_per_grid_ts"] = torch.full(
+                    (inputs["video_grid_thw"].shape[0],),
+                    float(seconds_per_grid),
+                    dtype=torch.float32,
+                )
 
         action_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|action|>")
 
@@ -444,6 +530,38 @@ class DataCollator:
         ].shape[0]
 
         return inputs
+
+
+def _build_lerobot_delta_timestamps(repo_id, dataset_fps, dataload_config):
+    """Build action and optional V1 video camera windows for LeRobotDataset."""
+    delta_timestamps = {
+        KEY_MAPPINGS[repo_id]["action"]: [
+            t / dataset_fps
+            for t in range(dataload_config.get("action_horizon", 33) - 1)
+        ],
+    }
+
+    if dataload_config.get("media_type", "image") == "video":
+        num_frames = int(dataload_config.get("video_num_frames", 8))
+        stride = int(dataload_config.get("video_stride", 1))
+        if num_frames <= 0:
+            raise ValueError(
+                "data.video_num_frames must be positive for video media_type."
+            )
+        if stride <= 0:
+            raise ValueError(
+                "data.video_stride must be positive for video media_type."
+            )
+
+        # V1 video path: use a history window ending at the current dataset index.
+        camera_offsets = [
+            -(num_frames - 1 - i) * stride / dataset_fps for i in range(num_frames)
+        ]
+        for camera_key in KEY_MAPPINGS[repo_id]["camera"]:
+            delta_timestamps[camera_key] = camera_offsets
+        dataload_config["video_seconds_per_grid"] = stride / dataset_fps
+
+    return delta_timestamps
 
 
 def load_lerobot_data(
@@ -488,13 +606,9 @@ def load_lerobot_data(
     # ), "norm stats is required, please refer to 'wall-x/scripts/compute_norm_stats.py' to compute stats"
     # norm_stats = load_norm_stats(norm_stats_path, repo_id)
 
-    delta_timestamps = {
-        # action chunk
-        KEY_MAPPINGS[repo_id]["action"]: [
-            t / dataset_fps
-            for t in range(dataload_config.get("action_horizon", 33) - 1)
-        ],
-    }
+    delta_timestamps = _build_lerobot_delta_timestamps(
+        repo_id, dataset_fps, dataload_config
+    )
     batch_size = config.get("batch_size_per_gpu", 8)
     episodes = np.arange(episodes_num).tolist()
 
@@ -584,6 +698,9 @@ def get_data_configs(config):
     default_data_config = {
         "train_test_split": 0.95,
         "split_seed": 42,
+        "media_type": "image",
+        "video_num_frames": 8,
+        "video_stride": 1,
         "batch_size": 8,
         "action_horizon": 21,
         "action_history_length": 0,
@@ -682,13 +799,9 @@ def load_test_dataset(
     ), "norm stats is required, please refer to 'wall-x/scripts/compute_norm_stats.py' to compute stats"
     # norm_stats = load_norm_stats(norm_stats_path, repo_id)
 
-    delta_timestamps = {
-        # action chunk
-        KEY_MAPPINGS[repo_id]["action"]: [
-            t / dataset_fps
-            for t in range(dataload_config.get("action_horizon", 33) - 1)
-        ],
-    }
+    delta_timestamps = _build_lerobot_delta_timestamps(
+        repo_id, dataset_fps, dataload_config
+    )
 
     dataset = LeRobotDataset(
         repo_id,

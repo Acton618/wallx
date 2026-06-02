@@ -140,6 +140,11 @@ data:
   action_horizon: 32
   train_test_split: 0.95
 
+  # V1 media input. Keep image as the default to preserve the original Wall-X path.
+  media_type: image  # image | video
+  video_num_frames: 8
+  video_stride: 1
+
   # Action keys for observation and prediction
   obs_action_keys:
     - follow_left_ee_cartesian_pos

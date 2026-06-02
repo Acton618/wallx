@@ -172,11 +172,19 @@ def preprocesser_call(
         image_inputs = {}
         image_grid_thw = None
 
-    # Process video inputs
+    # V1 video path: prefer an explicit video_processor when the checkpoint provides one.
     if videos is not None:
-        videos_inputs = processor.image_processor(
-            images=None, videos=videos, return_tensors=return_tensors
+        video_processor = getattr(
+            processor, "video_processor", processor.image_processor
         )
+        try:
+            videos_inputs = video_processor(
+                videos=videos, return_tensors=return_tensors
+            )
+        except TypeError:
+            videos_inputs = video_processor(
+                images=None, videos=videos, return_tensors=return_tensors
+            )
         video_grid_thw = videos_inputs["video_grid_thw"]
     else:
         videos_inputs = {}
@@ -214,7 +222,14 @@ def preprocesser_call(
         index = 0
         for i in range(len(text)):
             while "<|video_pad|>" in text[i]:
-                # Replace video placeholder with actual token count
+                # V1 video path: keep placeholder count aligned with actual clips.
+                if index >= len(video_grid_thw):
+                    print(
+                        f"Warning: Number of video placeholders ({index + 1}) "
+                        f"exceeds actual videos ({len(video_grid_thw)}), "
+                        f"skipping remaining placeholder processing"
+                    )
+                    break
                 token_count = video_grid_thw[index].prod() // merge_length
                 text[i] = text[i].replace(
                     "<|video_pad|>", "<|placeholder|>" * token_count, 1
@@ -475,6 +490,7 @@ def get_wallx_normal_text(
     priority_order: Optional[OrderedDict] = None,
     cam_mapping: Optional[Dict[str, str]] = None,
     generate_subtask_ratio: float = 0.0,
+    media_type: str = "image",
 ) -> Tuple[str, bool]:
     """Construct complete multimodal prompt text for Wall-X model.
 
@@ -492,6 +508,8 @@ def get_wallx_normal_text(
         priority_order: Priority order for instruction sampling
         cam_mapping: Camera name mapping dictionary
         generate_subtask_ratio: Probability of generating subtask instead of actions
+        media_type: V1 media selector. Use "image" for <|image_pad|>
+            or "video" for <|video_pad|>.
 
     Returns:
         Tuple of (formatted_prompt_text, is_subtask_generation)
@@ -501,7 +519,14 @@ def get_wallx_normal_text(
     role_end_symbol = "<|im_end|>"
     vision_start_symbol = "<|vision_start|>"
     vision_end_symbol = "<|vision_end|>"
+    if media_type not in {"image", "video"}:
+        raise ValueError(
+            f"Unsupported media_type={media_type!r}; expected 'image' or 'video'."
+        )
     image_pad_symbol = "<|image_pad|>"
+    video_pad_symbol = "<|video_pad|>"
+    # V1 video path: prompt placeholders must match the processor branch.
+    vision_pad_symbol = video_pad_symbol if media_type == "video" else image_pad_symbol
     propri_symbol = "<|propri|>"
     action_symbol = "<|action|>"
     action_fast_symbol = "<|action_fast|>"
@@ -516,7 +541,10 @@ def get_wallx_normal_text(
     if cam_mapping:
         for _, cam_name in cam_mapping.items():
             view_name = CAMERA_NAME_MAPPING.get(cam_name, cam_name)
-            user_request += f" {view_name}: {vision_start_symbol}{image_pad_symbol}{vision_end_symbol}"
+            user_request += (
+                f" {view_name}: "
+                f"{vision_start_symbol}{vision_pad_symbol}{vision_end_symbol}"
+            )
     user_request += "\nInstruction:"
 
     # Get frame-specific instruction
