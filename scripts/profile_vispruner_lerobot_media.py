@@ -38,6 +38,7 @@ def build_train_config(args, enable_pruning: bool) -> dict:
         "keep_ratio": args.keep_ratio if enable_pruning else 1.0,
         "min_tokens": 1,
         "force_vision_eager": strategy == "topk_attention",
+        "prune_video": bool(getattr(args, "prune_video", False)),
     }
     if enable_pruning and strategy in {"predictor_score", "predictor_early"}:
         vispruner_config["predictor"] = {

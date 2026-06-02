@@ -219,6 +219,7 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         vispruner_keep_ratio=1.0,
         vispruner_min_tokens=1,
         vispruner_force_vision_eager=True,
+        vispruner_prune_video=False,
         vispruner_predictor_path=None,
         vispruner_predictor_source="image_embeds",
         vispruner_predictor_early_layer=None,
@@ -282,6 +283,7 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         self.vispruner_keep_ratio = vispruner_keep_ratio
         self.vispruner_min_tokens = vispruner_min_tokens
         self.vispruner_force_vision_eager = vispruner_force_vision_eager
+        self.vispruner_prune_video = vispruner_prune_video
         self.vispruner_predictor_path = vispruner_predictor_path
         self.vispruner_predictor_source = vispruner_predictor_source
         self.vispruner_predictor_early_layer = vispruner_predictor_early_layer

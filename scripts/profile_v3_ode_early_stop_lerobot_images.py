@@ -375,6 +375,8 @@ def main():
     parser.add_argument("--disable-pruning", dest="enable_pruning", action="store_false")
     parser.add_argument("--pruned-strategy", default="topk_attention")
     parser.add_argument("--keep-ratio", type=float, default=0.5)
+    parser.add_argument("--prune-video", action="store_true", default=False)
+    parser.add_argument("--no-prune-video", dest="prune_video", action="store_false")
     parser.add_argument("--predictor-checkpoint", default=None)
     parser.add_argument("--predictor-source", default="image_embeds")
     parser.add_argument("--predictor-early-layer", type=int, default=None)

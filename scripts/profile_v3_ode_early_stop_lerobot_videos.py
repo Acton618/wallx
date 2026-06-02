@@ -23,7 +23,6 @@ from scripts.profile_v3_ode_early_stop_lerobot_images import (
 from scripts.profile_vispruner_lerobot_media import (
     average_timing_dict,
     build_common_fields,
-    count_tokens,
     format_text,
     load_model,
     mean,
@@ -97,6 +96,31 @@ def make_video_batch(model, item, args):
     return inputs.to(args.device), meta
 
 
+def video_token_count_from_grid(video_grid_thw, spatial_merge_size: int) -> int:
+    total = 0
+    for grid in video_grid_thw:
+        temporal, height, width = [int(x) for x in grid]
+        total += temporal * (height // spatial_merge_size) * (width // spatial_merge_size)
+    return total
+
+
+def expected_video_tokens_after_prune(args, model, video_grid_thw) -> int:
+    spatial_merge_size = int(model.config.vision_config.spatial_merge_size)
+    before = video_token_count_from_grid(video_grid_thw, spatial_merge_size)
+    # V4 video pruning happens inside generate_flow_action(), after processor
+    # expansion and before token embedding. The batch still contains the original
+    # video placeholder count, so the profiling script reports the expected
+    # internal count from the same keep_ratio/min_tokens used by VisPruner.
+    if not (args.enable_pruning and args.prune_video):
+        return before
+
+    kept = 0
+    for grid in video_grid_thw:
+        length = video_token_count_from_grid([grid], spatial_merge_size)
+        kept += max(1, int(np.ceil(length * float(args.keep_ratio))))
+    return kept
+
+
 @torch.no_grad()
 def run_case(args, model, items, case_name):
     records = []
@@ -110,9 +134,12 @@ def run_case(args, model, items, case_name):
         sync_if_cuda(args.device)
         prepare_ms = (time.perf_counter() - prepare_start) * 1000.0
 
-        tokens_before = count_tokens(model, batch, "video")
-        tokens_after = tokens_before
         video_grid_thw = batch["video_grid_thw"].detach().cpu().tolist()
+        tokens_before = video_token_count_from_grid(
+            video_grid_thw,
+            int(model.config.vision_config.spatial_merge_size),
+        )
+        tokens_after = expected_video_tokens_after_prune(args, model, video_grid_thw)
         second_per_grid_ts = batch["second_per_grid_ts"].detach().cpu().tolist()
 
         call_kwargs = dict(
@@ -185,7 +212,7 @@ def run_case(args, model, items, case_name):
         records.append(record)
         print(
             f"[V3_VIDEO] {case_name} {idx}/{len(items)} "
-            f"video_tokens={tokens_before} grid={video_grid_thw} "
+            f"video_tokens={tokens_before}->{tokens_after} grid={video_grid_thw} "
             f"updates={record['ode_early_stop']['actual_steps_mean']:.2f} "
             f"total_ms={avg_timing.get('total_time', 0.0):.3f} "
             f"ode_ms={avg_timing.get('ode_integration', 0.0):.3f}",
@@ -267,7 +294,7 @@ def write_outputs(args, records, counts):
     fixed_ode = fixed["timings_ms"].get("ode_integration", 0.0)
 
     report = [
-        "# Wall-X V3 ODE Early Stop Video Dataset Report\n",
+        "# Wall-X V4 Video VisPruner + V3 ODE Early Stop Video Dataset Report\n",
         f"- video_dir: `{args.video_dir}`",
         f"- video_glob: `{args.video_glob}`",
         f"- num_videos: `{args.num_videos}`",
@@ -275,6 +302,8 @@ def write_outputs(args, records, counts):
         f"- prompt: `{args.prompt}`",
         f"- model_path: `{args.model_path}`",
         f"- media_type: `video`",
+        f"- vispruner.prune_video: `{args.prune_video}`",
+        f"- vispruner.keep_ratio: `{args.keep_ratio}`",
         f"- num_inference_timesteps: `{args.num_inference_timesteps}`",
         f"- warmup: `{args.warmup}`",
         f"- iters: `{args.iters}`",
@@ -297,8 +326,8 @@ def write_outputs(args, records, counts):
     report.extend([
         "",
         "## Summary\n",
-        "| case | video_tokens | total_ms | total_delta_vs_fixed | ode_ms | ode_delta_vs_fixed | actual_updates | postfix_steps | stopped_rate | action_mae_vs_fixed | action_rmse_vs_fixed | action_max_abs_vs_fixed |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| case | video_tokens_before | expected_video_tokens_after | total_ms | total_delta_vs_fixed | ode_ms | ode_delta_vs_fixed | actual_updates | postfix_steps | stopped_rate | action_mae_vs_fixed | action_rmse_vs_fixed | action_max_abs_vs_fixed |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ])
     for case in CASE_SPECS:
         summary = summaries[case]
@@ -306,7 +335,8 @@ def write_outputs(args, records, counts):
         ode = summary["timings_ms"].get("ode_integration", 0.0)
         err = errors.get(case, {"mae": 0.0, "rmse": 0.0, "max_abs": 0.0})
         report.append(
-            f"| `{case}` | {summary['tokens_before']:.2f} | {total:.3f} | {pct_delta(total, fixed_total):+.2f}% | "
+            f"| `{case}` | {summary['tokens_before']:.2f} | {summary['tokens_after']:.2f} | "
+            f"{total:.3f} | {pct_delta(total, fixed_total):+.2f}% | "
             f"{ode:.3f} | {pct_delta(ode, fixed_ode):+.2f}% | "
             f"{summary['actual_steps_mean']:.2f} | {summary['postfix_steps_mean']:.2f} | "
             f"{summary['stopped_rate']:.2%} | {err['mae']:.6f} | {err['rmse']:.6f} | {err['max_abs']:.6f} |"
@@ -316,6 +346,7 @@ def write_outputs(args, records, counts):
         "",
         "## Interpretation\n",
         "- This report uses MP4 video clips only. The model input contains `pixel_values_videos`, `video_grid_thw`, and explicit `second_per_grid_ts` from decoded FPS.",
+        "- `expected_video_tokens_after` is the V4 internal video token count after VisPruner. The raw batch still contains the original placeholders before the model prunes them.",
         "- Accuracy is action difference against `fixed_10` under the same video sample and seed; it measures how much V3 early stop changes the original fixed-step inference output.",
         "- `actual_updates` counts the existing prefetch update plus later postfix ODE updates. `postfix_steps` is `actual_updates - 1`.",
         "- Fine-grained timings use `profile_timing=True`, so use paired deltas rather than absolute latency as the main signal.",
@@ -380,6 +411,8 @@ def main():
     parser.add_argument("--disable-pruning", dest="enable_pruning", action="store_false")
     parser.add_argument("--pruned-strategy", default="topk_attention")
     parser.add_argument("--keep-ratio", type=float, default=0.5)
+    parser.add_argument("--prune-video", action="store_true", default=False)
+    parser.add_argument("--no-prune-video", dest="prune_video", action="store_false")
     parser.add_argument("--predictor-checkpoint", default=None)
     parser.add_argument("--predictor-source", default="image_embeds")
     parser.add_argument("--predictor-early-layer", type=int, default=None)

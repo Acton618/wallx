@@ -1169,6 +1169,15 @@ class Qwen2_5_VLMoEForAction(
             and self.vispruner.enabled
         )
 
+    def _should_prune_videos(self, pixel_values_videos, video_grid_thw) -> bool:
+        # V4: video token pruning is opt-in so existing V1/V2 video behavior stays stable.
+        return (
+            pixel_values_videos is not None
+            and video_grid_thw is not None
+            and self.vispruner.enabled
+            and bool(getattr(self.config, "vispruner_prune_video", False))
+        )
+
     def _build_vispruner_score_predictor(self):
         strategy = str(getattr(self.config, "vispruner_strategy", "original"))
         if strategy not in {"predictor_score", "predictor_early"}:
@@ -1449,6 +1458,122 @@ class Qwen2_5_VLMoEForAction(
         image_mask = mask_expanded.to(inputs_embeds.device)
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         return inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+    def _encode_videos_and_maybe_prune(
+        self,
+        pixel_values_videos,
+        video_grid_thw,
+        input_ids,
+        attention_mask=None,
+        labels=None,
+        moe_token_types=None,
+        position_ids=None,
+        image_grid_thw=None,
+        second_per_grid_ts=None,
+        perf_timer=None,
+    ):
+        if perf_timer is not None:
+            perf_timer.start("video_path_total")
+            perf_timer.start("video_cast")
+        pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+        if perf_timer is not None:
+            perf_timer.stop("video_cast")
+
+        if self._should_prune_videos(pixel_values_videos, video_grid_thw):
+            strategy = str(getattr(self.config, "vispruner_strategy", "original"))
+            if strategy == "topk_attention":
+                if perf_timer is not None:
+                    perf_timer.start("vision_video_encode_score")
+                video_embeds, video_scores = self.visual(
+                    pixel_values_videos, grid_thw=video_grid_thw, output_attentions=True
+                )
+                if perf_timer is not None:
+                    perf_timer.stop("vision_video_encode_score")
+            elif strategy == "norm":
+                if perf_timer is not None:
+                    perf_timer.start("vision_video_encode")
+                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                video_scores = None
+                if perf_timer is not None:
+                    perf_timer.stop("vision_video_encode")
+            else:
+                raise ValueError(
+                    "V4 video VisPruner currently supports strategies "
+                    "'topk_attention' and 'norm'. Predictor strategies remain "
+                    "image-only unless a video-trained predictor is added."
+                )
+
+            if perf_timer is not None:
+                perf_timer.start("video_pruning_position_ids_prepare")
+            position_ids = self._ensure_position_ids_for_pruning(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+            )
+            if perf_timer is not None:
+                perf_timer.stop("video_pruning_position_ids_prepare")
+
+            prune_result = self.vispruner(
+                image_embeds=video_embeds,
+                image_scores=video_scores,
+                input_ids=input_ids,
+                image_grid_thw=video_grid_thw,
+                image_token_id=self.config.video_token_id,
+                spatial_merge_size=self.config.vision_config.spatial_merge_size,
+                attention_mask=attention_mask,
+                labels=labels,
+                moe_token_types=moe_token_types,
+                position_ids=position_ids,
+                pad_token_id=self._pad_token_id(),
+                perf_timer=perf_timer,
+            )
+            if prune_result.rope_deltas is not None:
+                self.rope_deltas = prune_result.rope_deltas
+            if perf_timer is not None:
+                perf_timer.stop("video_path_total")
+            return (
+                prune_result.image_embeds,
+                prune_result.input_ids,
+                prune_result.attention_mask,
+                prune_result.labels,
+                prune_result.moe_token_types,
+                prune_result.position_ids,
+                prune_result.pruned,
+            )
+
+        if perf_timer is not None:
+            perf_timer.start("vision_video_encode")
+        video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+        if perf_timer is not None:
+            perf_timer.stop("vision_video_encode")
+            perf_timer.stop("video_path_total")
+        return (
+            video_embeds,
+            input_ids,
+            attention_mask,
+            labels,
+            moe_token_types,
+            position_ids,
+            False,
+        )
+
+    def _scatter_video_embeds(self, inputs_embeds, input_ids, video_embeds):
+        n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
+        n_video_features = video_embeds.shape[0]
+        if n_video_tokens != n_video_features:
+            raise ValueError(
+                f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
+            )
+
+        mask = input_ids == self.config.video_token_id
+        mask_unsqueezed = mask.unsqueeze(-1)
+        mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
+        video_mask = mask_expanded.to(inputs_embeds.device)
+        video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        return inputs_embeds.masked_scatter(video_mask, video_embeds)
 
     def get_rope_index(
         self,
@@ -2767,6 +2892,36 @@ class Qwen2_5_VLMoEForAction(
                     start_indices, end_indices = None, None
                     prefix_length = None
 
+            video_embeds = None
+            video_pruned = False
+            if pixel_values_videos is not None:
+                # PERF PROFILING ADDED: isolate video vision tower latency and V4 pruning.
+                perf_timer.start("vision_video_forward")
+                (
+                    video_embeds,
+                    input_ids,
+                    attention_mask,
+                    labels,
+                    moe_token_types,
+                    position_ids,
+                    video_pruned,
+                ) = self._encode_videos_and_maybe_prune(
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    moe_token_types=moe_token_types,
+                    position_ids=position_ids,
+                    image_grid_thw=image_grid_thw,
+                    second_per_grid_ts=second_per_grid_ts,
+                    perf_timer=perf_timer,
+                )
+                perf_timer.stop("vision_video_forward")
+                if video_pruned:
+                    start_indices, end_indices = None, None
+                    prefix_length = None
+
             perf_timer.start("embed_tokens")
             inputs_embeds = self.model.embed_tokens(input_ids)
             perf_timer.stop("embed_tokens")
@@ -2777,29 +2932,11 @@ class Qwen2_5_VLMoEForAction(
                 )
                 perf_timer.stop("scatter_image_embeds")
 
-            if pixel_values_videos is not None:
-                pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
-                # PERF PROFILING ADDED: isolate video vision tower latency.
-                perf_timer.start("vision_video_forward")
-                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-                perf_timer.stop("vision_video_forward")
-                n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
-                n_video_features = video_embeds.shape[0]
-                if n_video_tokens != n_video_features:
-                    raise ValueError(
-                        f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
-                    )
-
-                mask = input_ids == self.config.video_token_id
-                mask_unsqueezed = mask.unsqueeze(-1)
-                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-                video_mask = mask_expanded.to(inputs_embeds.device)
-
-                video_embeds = video_embeds.to(
-                    inputs_embeds.device, inputs_embeds.dtype
-                )
+            if video_embeds is not None:
                 perf_timer.start("scatter_video_embeds")
-                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+                inputs_embeds = self._scatter_video_embeds(
+                    inputs_embeds, input_ids, video_embeds
+                )
                 perf_timer.stop("scatter_video_embeds")
 
             if (

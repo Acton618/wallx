@@ -40,6 +40,8 @@ vispruner:
   keep_ratio: 1.0
   min_tokens: 1
   force_vision_eager: true
+  # V4 video VisPruner. Disabled by default to preserve V1/V2 video outputs.
+  prune_video: false
 
 # ODE distillation student switch. Disabled by default to keep original Wall-X inference.
 ode_distill:

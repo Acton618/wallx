@@ -52,6 +52,15 @@ def apply_vispruner_config(train_config, model_config):
             ),
         )
     )
+    model_config.vispruner_prune_video = bool(
+        vispruner_config.get(
+            "prune_video",
+            train_config.get(
+                "vispruner_prune_video",
+                getattr(model_config, "vispruner_prune_video", False),
+            ),
+        )
+    )
     predictor_config = vispruner_config.get("predictor", {}) or {}
     model_config.vispruner_predictor_path = predictor_config.get(
         "checkpoint",
