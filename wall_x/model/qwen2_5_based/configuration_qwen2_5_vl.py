@@ -225,6 +225,11 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         vispruner_predictor_hidden_dim=None,
         vispruner_predictor_dropout=0.0,
         vispruner_predictor_strict_load=True,
+        ode_early_stop_enable=False,
+        ode_early_stop_threshold=0.01,
+        ode_early_stop_min_steps=2,
+        ode_early_stop_metric="mean_abs",
+        ode_early_stop_patience=1,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -283,6 +288,11 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         self.vispruner_predictor_hidden_dim = vispruner_predictor_hidden_dim
         self.vispruner_predictor_dropout = vispruner_predictor_dropout
         self.vispruner_predictor_strict_load = vispruner_predictor_strict_load
+        self.ode_early_stop_enable = ode_early_stop_enable
+        self.ode_early_stop_threshold = ode_early_stop_threshold
+        self.ode_early_stop_min_steps = ode_early_stop_min_steps
+        self.ode_early_stop_metric = ode_early_stop_metric
+        self.ode_early_stop_patience = ode_early_stop_patience
 
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.

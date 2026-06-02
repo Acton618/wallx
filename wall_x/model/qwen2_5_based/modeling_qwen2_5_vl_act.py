@@ -2701,6 +2701,11 @@ class Qwen2_5_VLMoEForAction(
         profile_timing: Optional[bool] = False,
         profile_complexity: Optional[bool] = False,
         print_timing: Optional[bool] = False,
+        ode_early_stop_enable: Optional[bool] = None,
+        ode_early_stop_threshold: Optional[float] = None,
+        ode_early_stop_min_steps: Optional[int] = None,
+        ode_early_stop_metric: Optional[str] = None,
+        ode_early_stop_patience: Optional[int] = None,
         **kwargs,
     ):
 
@@ -3136,15 +3141,91 @@ class Qwen2_5_VLMoEForAction(
             perf_timer.stop("ode_action_head_total")
             return v_t
 
-        action_trajectory = odeint(
-            step_with_kvcache, noisy_action, times[1:], method="euler"
-        )
+        if ode_early_stop_enable is None:
+            ode_early_stop_enable = bool(
+                getattr(self.config, "ode_early_stop_enable", False)
+            )
+        if ode_early_stop_threshold is None:
+            ode_early_stop_threshold = float(
+                getattr(self.config, "ode_early_stop_threshold", 0.01)
+            )
+        if ode_early_stop_min_steps is None:
+            ode_early_stop_min_steps = int(
+                getattr(self.config, "ode_early_stop_min_steps", 2)
+            )
+        if ode_early_stop_metric is None:
+            ode_early_stop_metric = str(
+                getattr(self.config, "ode_early_stop_metric", "mean_abs")
+            )
+        if ode_early_stop_patience is None:
+            ode_early_stop_patience = int(
+                getattr(self.config, "ode_early_stop_patience", 1)
+            )
+
+        ode_early_stop_info = {
+            "enabled": bool(ode_early_stop_enable),
+            "stopped": False,
+            "metric": ode_early_stop_metric,
+            "threshold": float(ode_early_stop_threshold),
+            "min_steps": int(ode_early_stop_min_steps),
+            "patience": int(ode_early_stop_patience),
+            "actual_steps": int(num_inference_timesteps),
+            "last_delta": None,
+        }
+
+        if ode_early_stop_enable:
+            current_action = noisy_action
+            no_change_count = 0
+            actual_steps = 1  # prefetch has already advanced t=0 -> t=dt.
+
+            for step_i, timestep in enumerate(times[1:-1], start=1):
+                previous_action = current_action
+                velocity = step_with_kvcache(timestep, current_action)
+                step_dt = times[step_i + 1] - times[step_i]
+                current_action = current_action + step_dt * velocity
+                actual_steps += 1
+
+                # V3 early stop watches action convergence after the existing
+                # prefetch step. Disabled configs still use the original odeint path.
+                action_delta = (current_action - previous_action).detach()
+                if ode_early_stop_metric == "max_abs":
+                    delta_value = action_delta.abs().max()
+                elif ode_early_stop_metric == "l2":
+                    flat_delta = action_delta.reshape(action_delta.shape[0], -1)
+                    delta_value = torch.linalg.vector_norm(flat_delta, dim=1).mean()
+                elif ode_early_stop_metric == "mean_abs":
+                    delta_value = action_delta.abs().mean()
+                else:
+                    raise ValueError(
+                        f"Unsupported ode_early_stop_metric={ode_early_stop_metric!r}; "
+                        "expected mean_abs, max_abs, or l2."
+                    )
+                ode_early_stop_info["last_delta"] = float(delta_value.item())
+
+                if (
+                    actual_steps >= ode_early_stop_min_steps
+                    and delta_value.item() < ode_early_stop_threshold
+                ):
+                    no_change_count += 1
+                else:
+                    no_change_count = 0
+
+                if no_change_count >= ode_early_stop_patience:
+                    ode_early_stop_info["stopped"] = True
+                    break
+
+            ode_early_stop_info["actual_steps"] = actual_steps
+            predict_action = current_action
+        else:
+            action_trajectory = odeint(
+                step_with_kvcache, noisy_action, times[1:], method="euler"
+            )
+            predict_action = action_trajectory[-1]
 
         perf_timer.stop("ode_integration")
 
         # PERF PROFILING ADDED: measure action unnormalization/output assembly.
         perf_timer.start("postprocessing")
-        predict_action = action_trajectory[-1]
         if unnorm:
             perf_timer.start("postprocess_unnorm")
             predict_action = (
@@ -3154,6 +3235,7 @@ class Qwen2_5_VLMoEForAction(
             )
             perf_timer.stop("postprocess_unnorm")
         output["predict_action"] = predict_action
+        output["ode_early_stop_info"] = ode_early_stop_info
         # normalize action chunk to get gt_action
         if action_chunk is not None:
             perf_timer.start("postprocess_gt_action")

@@ -161,6 +161,32 @@ def update_model_config(train_config, model_config):
     model_config.ode_distill_student_num_inference_timesteps = int(
         ode_distill_config.get("student_num_inference_timesteps", 4)
     )
+    ode_early_stop_config = train_config.get("ode_early_stop", {}) or {}
+    model_config.ode_early_stop_enable = bool(
+        ode_early_stop_config.get(
+            "enable", getattr(model_config, "ode_early_stop_enable", False)
+        )
+    )
+    model_config.ode_early_stop_threshold = float(
+        ode_early_stop_config.get(
+            "threshold", getattr(model_config, "ode_early_stop_threshold", 0.01)
+        )
+    )
+    model_config.ode_early_stop_min_steps = int(
+        ode_early_stop_config.get(
+            "min_steps", getattr(model_config, "ode_early_stop_min_steps", 2)
+        )
+    )
+    model_config.ode_early_stop_metric = str(
+        ode_early_stop_config.get(
+            "metric", getattr(model_config, "ode_early_stop_metric", "mean_abs")
+        )
+    )
+    model_config.ode_early_stop_patience = int(
+        ode_early_stop_config.get(
+            "patience", getattr(model_config, "ode_early_stop_patience", 1)
+        )
+    )
 
     return model_config
 

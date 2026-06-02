@@ -56,6 +56,15 @@ ode_distill:
       - q_proj
       - v_proj
 
+# V3 ODE early stop. Keep disabled by default so fixed-step image/video
+# regression remains comparable with original Wall-X.
+ode_early_stop:
+  enable: false
+  threshold: 0.01
+  min_steps: 2
+  metric: mean_abs  # mean_abs | max_abs | l2
+  patience: 1
+
 # Robot configuration - Define degrees of freedom for each component
 dof_config:
   follow_left_ee_cartesian_pos: 3      # Left end-effector Cartesian position
