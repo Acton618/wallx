@@ -1,0 +1,31 @@
+ode_distill:
+  enable: true
+  student_checkpoint_path: /root/autodl-tmp/wall_x/workspace/ode_distill_ckpts/ode_student_3000train_1000val_step6_same_seed_dropout0_epoch3
+  teacher_num_inference_timesteps: 10
+  student_num_inference_timesteps: 6
+  lora:
+    enable: true
+    r: 8
+    alpha: 16
+    dropout: 0.0
+    target_modules:
+    - q_proj
+    - v_proj
+data:
+  dataset_root: /root/autodl-tmp/wall_x/datasheet/libero_all
+  repo_id: libero_all
+  image_key: observation.images.faceImg
+  train_samples: 3000
+  val_samples: 1000
+  sample_strategy: linspace
+training:
+  epochs: 3
+  learning_rate: 1.0e-05
+  weight_decay: 0.0
+  grad_clip: 1.0
+  seed: 1234
+model_path: /root/autodl-tmp/wall_x/pretrained/wall-oss-fast
+vispruner:
+  enable: false
+  keep_ratio: 0.5
+  strategy: topk_attention
