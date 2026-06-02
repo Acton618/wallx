@@ -1,0 +1,209 @@
+{
+  "meta": {
+    "device": "cuda",
+    "model_path": "/root/autodl-tmp/wall_x/pretrained/wall-oss-fast",
+    "prompt": "pick up the object",
+    "dataset_name": "x2_normal",
+    "cameras": [
+      "face_view",
+      "right_wrist_view"
+    ],
+    "image_frame_index": 59,
+    "video_frame_indices": [
+      56,
+      57,
+      58,
+      59
+    ],
+    "face_video": "/root/autodl-tmp/wall_x/datasheet/libero_all/videos/chunk-000/observation.images.faceImg/episode_000000.mp4",
+    "right_video": "/root/autodl-tmp/wall_x/datasheet/libero_all/videos/chunk-000/observation.images.rightImg/episode_000000.mp4",
+    "face_video_meta": {
+      "frames": 150,
+      "fps": 15.0
+    },
+    "right_video_meta": {
+      "frames": 150,
+      "fps": 15.0
+    },
+    "num_inference_timesteps": 3,
+    "seed": 1234,
+    "unnorm": false
+  },
+  "image": {
+    "batch": {
+      "keys": [
+        "agent_pos_mask",
+        "attention_mask",
+        "dataset_names",
+        "dof_mask",
+        "image_grid_thw",
+        "input_ids",
+        "labels",
+        "moe_token_types",
+        "pixel_values",
+        "proprioception"
+      ],
+      "seq_len": 254,
+      "image_token_count": 162,
+      "video_token_count": 0,
+      "image_grid_thw": [
+        [
+          1,
+          18,
+          18
+        ],
+        [
+          1,
+          18,
+          18
+        ]
+      ],
+      "image_feature_count_from_grid": 162,
+      "pixel_values_shape": [
+        648,
+        1176
+      ]
+    },
+    "action_shape": [
+      1,
+      32,
+      20
+    ],
+    "action_first_step_first_7": [
+      -2.537507,
+      -0.855944,
+      4.789412,
+      1.646224,
+      -1.80792,
+      -0.47477,
+      3.327271
+    ],
+    "action_first_3_steps_first_7": [
+      [
+        -2.537507,
+        -0.855944,
+        4.789412,
+        1.646224,
+        -1.80792,
+        -0.47477,
+        3.327271
+      ],
+      [
+        1.057363,
+        -1.592141,
+        5.06107,
+        2.493967,
+        -0.313613,
+        -0.383763,
+        4.297078
+      ],
+      [
+        -1.82755,
+        -1.752136,
+        6.578919,
+        2.448797,
+        -1.514676,
+        0.580418,
+        7.537212
+      ]
+    ],
+    "action_mean": 0.098987,
+    "action_std": 3.508232,
+    "elapsed_ms": 448.326,
+    "peak_memory_gb": 8.024
+  },
+  "video": {
+    "batch": {
+      "keys": [
+        "agent_pos_mask",
+        "attention_mask",
+        "dataset_names",
+        "dof_mask",
+        "input_ids",
+        "labels",
+        "moe_token_types",
+        "pixel_values_videos",
+        "proprioception",
+        "second_per_grid_ts",
+        "video_grid_thw"
+      ],
+      "seq_len": 416,
+      "image_token_count": 0,
+      "video_token_count": 324,
+      "video_grid_thw": [
+        [
+          2,
+          18,
+          18
+        ],
+        [
+          2,
+          18,
+          18
+        ]
+      ],
+      "video_feature_count_from_grid": 324,
+      "pixel_values_videos_shape": [
+        1296,
+        1176
+      ],
+      "second_per_grid_ts": [
+        0.06666667014360428,
+        0.06666667014360428
+      ]
+    },
+    "action_shape": [
+      1,
+      32,
+      20
+    ],
+    "action_first_step_first_7": [
+      -2.533498,
+      -0.880306,
+      4.766153,
+      1.607757,
+      -1.781473,
+      -0.499249,
+      3.275504
+    ],
+    "action_first_3_steps_first_7": [
+      [
+        -2.533498,
+        -0.880306,
+        4.766153,
+        1.607757,
+        -1.781473,
+        -0.499249,
+        3.275504
+      ],
+      [
+        1.089567,
+        -1.603358,
+        4.993923,
+        2.471771,
+        -0.285566,
+        -0.37827,
+        4.243365
+      ],
+      [
+        -1.825339,
+        -1.800619,
+        6.570569,
+        2.436517,
+        -1.536073,
+        0.622329,
+        7.509057
+      ]
+    ],
+    "action_mean": 0.09331,
+    "action_std": 3.505936,
+    "elapsed_ms": 205.156,
+    "peak_memory_gb": 8.301
+  },
+  "comparison": {
+    "first_3_steps_first_7_mean_abs_diff": 0.027409,
+    "first_3_steps_first_7_max_abs_diff": 0.067147,
+    "image_tokens_match_features": true,
+    "video_tokens_match_features": true
+  }
+}

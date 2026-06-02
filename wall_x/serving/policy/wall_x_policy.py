@@ -122,6 +122,8 @@ class WallXPolicy(BasePolicy):
             "pred_horizon": self.pred_horizon,
             "device": self.device,
             "predict_mode": self.predict_mode,
+            "supported_media_types": ["image", "video"],
+            "video_schema": 'obs["media_type"]="video", obs["video_frames"][camera_key]=frames',
         }
 
     def reset(self) -> None:

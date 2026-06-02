@@ -2205,6 +2205,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             attention_mask = attention_mask.to(total_input_ids.device)
             for i, input_ids in enumerate(total_input_ids):
                 input_ids = input_ids[attention_mask[i] == 1]
+                # Video RoPE can multiply by GPU-side second_per_grid_ts, so keep
+                # every generated position index on the same device as input_ids.
+                pos_device = input_ids.device
                 image_nums, video_nums = 0, 0
                 vision_start_indices = torch.argwhere(
                     input_ids == vision_start_token_id
@@ -2246,6 +2249,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                             second_per_grid_t = second_per_grid_ts[video_index]
                         else:
                             second_per_grid_t = 1.0
+                        if torch.is_tensor(second_per_grid_t):
+                            second_per_grid_t = second_per_grid_t.to(pos_device)
                         video_index += 1
                         remain_videos -= 1
                         ed = ed_video
@@ -2262,10 +2267,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                         else 0
                     )
                     llm_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                        torch.arange(text_len, device=pos_device).view(1, -1).expand(3, -1) + st_idx
                     )
 
-                    range_tensor = torch.arange(llm_grid_t).view(-1, 1)
+                    range_tensor = torch.arange(llm_grid_t, device=pos_device).view(-1, 1)
                     expanded_range = range_tensor.expand(-1, llm_grid_h * llm_grid_w)
 
                     time_tensor = (
@@ -2278,13 +2283,13 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     t_index = time_tensor_long.flatten()
 
                     h_index = (
-                        torch.arange(llm_grid_h)
+                        torch.arange(llm_grid_h, device=pos_device)
                         .view(1, -1, 1)
                         .expand(llm_grid_t, -1, llm_grid_w)
                         .flatten()
                     )
                     w_index = (
-                        torch.arange(llm_grid_w)
+                        torch.arange(llm_grid_w, device=pos_device)
                         .view(1, 1, -1)
                         .expand(llm_grid_t, llm_grid_h, -1)
                         .flatten()
@@ -2302,7 +2307,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     )
                     text_len = len(input_tokens) - st
                     llm_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                        torch.arange(text_len, device=pos_device).view(1, -1).expand(3, -1) + st_idx
                     )
 
                 llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
