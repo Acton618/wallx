@@ -474,9 +474,10 @@ class DataCollator:
                     item["image_inputs"] for item in batch
                 ]
             elif key == "video_inputs":
-                # V1 video path: batch keeps one ordered clip per camera placeholder.
+                # V1 video path: flatten clips in batch/camera order so each
+                # <|video_pad|> placeholder consumes exactly one video clip.
                 additional_inputs["video_inputs"] = [
-                    item["video_inputs"] for item in batch
+                    clip for item in batch for clip in item["video_inputs"]
                 ]
             elif key == "text":
                 additional_inputs["text"] = [item["text"] for item in batch]
