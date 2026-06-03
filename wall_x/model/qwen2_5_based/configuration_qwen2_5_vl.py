@@ -231,6 +231,9 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         ode_early_stop_min_steps=2,
         ode_early_stop_metric="mean_abs",
         ode_early_stop_patience=1,
+        ode_cache_enable=False,
+        ode_cache_interval=2,
+        ode_cache_start_step=2,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -295,6 +298,9 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         self.ode_early_stop_min_steps = ode_early_stop_min_steps
         self.ode_early_stop_metric = ode_early_stop_metric
         self.ode_early_stop_patience = ode_early_stop_patience
+        self.ode_cache_enable = ode_cache_enable
+        self.ode_cache_interval = ode_cache_interval
+        self.ode_cache_start_step = ode_cache_start_step
 
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.

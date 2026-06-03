@@ -197,6 +197,23 @@ def update_model_config(train_config, model_config):
         )
     )
 
+    ode_cache_config = train_config.get("ode_cache", {}) or {}
+    model_config.ode_cache_enable = bool(
+        ode_cache_config.get(
+            "enable", getattr(model_config, "ode_cache_enable", False)
+        )
+    )
+    model_config.ode_cache_interval = int(
+        ode_cache_config.get(
+            "interval", getattr(model_config, "ode_cache_interval", 2)
+        )
+    )
+    model_config.ode_cache_start_step = int(
+        ode_cache_config.get(
+            "start_step", getattr(model_config, "ode_cache_start_step", 2)
+        )
+    )
+
     return model_config
 
 

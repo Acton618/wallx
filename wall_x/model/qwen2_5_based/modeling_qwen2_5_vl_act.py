@@ -2831,6 +2831,9 @@ class Qwen2_5_VLMoEForAction(
         ode_early_stop_min_steps: Optional[int] = None,
         ode_early_stop_metric: Optional[str] = None,
         ode_early_stop_patience: Optional[int] = None,
+        ode_cache_enable: Optional[bool] = None,
+        ode_cache_interval: Optional[int] = None,
+        ode_cache_start_step: Optional[int] = None,
         **kwargs,
     ):
 
@@ -3229,7 +3232,34 @@ class Qwen2_5_VLMoEForAction(
         # PERF PROFILING ADDED: measure iterative flow/ODE decoding with KV-cache.
         perf_timer.start("ode_integration")
 
-        def step_with_kvcache(timestep, noisy_action):
+        ode_cache_runtime = {
+            "last_velocity": None,
+            "last_refresh_step": None,
+            "calls": 0,
+            "refreshes": 0,
+            "hits": 0,
+        }
+
+        def step_with_kvcache(timestep, noisy_action, ode_step_index=None):
+            ode_cache_runtime["calls"] += 1
+            if (
+                ode_cache_enable
+                and ode_cache_runtime["last_velocity"] is not None
+                and ode_step_index is not None
+                and ode_step_index >= ode_cache_start_step
+                and (ode_step_index - int(ode_cache_runtime["last_refresh_step"]))
+                < ode_cache_interval
+            ):
+                # V5 ODE cache: reuse the most recent velocity for nearby Euler
+                # steps. This is intentionally opt-in and leaves fixed_10 exact.
+                ode_cache_runtime["hits"] += 1
+                perf_timer.start("ode_cache_hit")
+                cached_velocity = ode_cache_runtime["last_velocity"]
+                perf_timer.stop("ode_cache_hit")
+                return cached_velocity
+
+            ode_cache_runtime["refreshes"] += 1
+            perf_timer.start("ode_cache_refresh")
             perf_timer.start("ode_action_embed_total")
             action_mask = (
                 postfix_input_ids == self.action_token_id_set["action_token_id"]
@@ -3276,6 +3306,11 @@ class Qwen2_5_VLMoEForAction(
                 v_t = action_pred
             v_t = v_t.reshape(batch_size, action_horizon, action_dim)
             perf_timer.stop("ode_action_head_total")
+            ode_cache_runtime["last_velocity"] = v_t.detach()
+            ode_cache_runtime["last_refresh_step"] = int(
+                ode_step_index if ode_step_index is not None else -1
+            )
+            perf_timer.stop("ode_cache_refresh")
             return v_t
 
         if ode_early_stop_enable is None:
@@ -3298,6 +3333,14 @@ class Qwen2_5_VLMoEForAction(
             ode_early_stop_patience = int(
                 getattr(self.config, "ode_early_stop_patience", 1)
             )
+        if ode_cache_enable is None:
+            ode_cache_enable = bool(getattr(self.config, "ode_cache_enable", False))
+        if ode_cache_interval is None:
+            ode_cache_interval = int(getattr(self.config, "ode_cache_interval", 2))
+        if ode_cache_start_step is None:
+            ode_cache_start_step = int(getattr(self.config, "ode_cache_start_step", 2))
+        ode_cache_interval = max(1, int(ode_cache_interval))
+        ode_cache_start_step = max(1, int(ode_cache_start_step))
 
         ode_early_stop_info = {
             "enabled": bool(ode_early_stop_enable),
@@ -3309,6 +3352,15 @@ class Qwen2_5_VLMoEForAction(
             "actual_steps": int(num_inference_timesteps),
             "last_delta": None,
         }
+        ode_cache_info = {
+            "enabled": bool(ode_cache_enable),
+            "interval": int(ode_cache_interval),
+            "start_step": int(ode_cache_start_step),
+            "calls": 0,
+            "refreshes": 0,
+            "hits": 0,
+            "hit_rate": 0.0,
+        }
 
         if ode_early_stop_enable:
             current_action = noisy_action
@@ -3317,7 +3369,9 @@ class Qwen2_5_VLMoEForAction(
 
             for step_i, timestep in enumerate(times[1:-1], start=1):
                 previous_action = current_action
-                velocity = step_with_kvcache(timestep, current_action)
+                velocity = step_with_kvcache(
+                    timestep, current_action, ode_step_index=actual_steps
+                )
                 step_dt = times[step_i + 1] - times[step_i]
                 current_action = current_action + step_dt * velocity
                 actual_steps += 1
@@ -3354,10 +3408,22 @@ class Qwen2_5_VLMoEForAction(
             ode_early_stop_info["actual_steps"] = actual_steps
             predict_action = current_action
         else:
-            action_trajectory = odeint(
-                step_with_kvcache, noisy_action, times[1:], method="euler"
+            current_action = noisy_action
+            for step_i, timestep in enumerate(times[1:-1], start=1):
+                velocity = step_with_kvcache(
+                    timestep, current_action, ode_step_index=step_i
+                )
+                step_dt = times[step_i + 1] - times[step_i]
+                current_action = current_action + step_dt * velocity
+            predict_action = current_action
+
+        ode_cache_info["calls"] = int(ode_cache_runtime["calls"])
+        ode_cache_info["refreshes"] = int(ode_cache_runtime["refreshes"])
+        ode_cache_info["hits"] = int(ode_cache_runtime["hits"])
+        if ode_cache_info["calls"]:
+            ode_cache_info["hit_rate"] = (
+                float(ode_cache_info["hits"]) / float(ode_cache_info["calls"])
             )
-            predict_action = action_trajectory[-1]
 
         perf_timer.stop("ode_integration")
 
@@ -3373,6 +3439,7 @@ class Qwen2_5_VLMoEForAction(
             perf_timer.stop("postprocess_unnorm")
         output["predict_action"] = predict_action
         output["ode_early_stop_info"] = ode_early_stop_info
+        output["ode_cache_info"] = ode_cache_info
         # normalize action chunk to get gt_action
         if action_chunk is not None:
             perf_timer.start("postprocess_gt_action")

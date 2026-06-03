@@ -67,6 +67,12 @@ ode_early_stop:
   metric: mean_abs  # mean_abs | max_abs | l2
   patience: 1
 
+# V5 ODE velocity cache. Disabled by default to preserve fixed-step outputs.
+ode_cache:
+  enable: false
+  interval: 2
+  start_step: 2
+
 # Robot configuration - Define degrees of freedom for each component
 dof_config:
   follow_left_ee_cartesian_pos: 3      # Left end-effector Cartesian position
