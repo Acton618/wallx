@@ -48,7 +48,11 @@ ode_distill:
   enable: false
   student_checkpoint_path: null
   teacher_num_inference_timesteps: 10
-  student_num_inference_timesteps: 4
+  student_num_inference_timesteps: 6
+  # V6 first version runs the student alone. Turn these on only for explicit
+  # V6+V5 or V6+V3 combination experiments.
+  allow_ode_cache: false
+  allow_ode_early_stop: false
   lora:
     enable: true
     r: 8

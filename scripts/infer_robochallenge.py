@@ -505,6 +505,10 @@ class WallxModelWrapper:
             print(
                 "[ODE_DISTILL] enabled, student_num_inference_timesteps",
                 self.ode_distill_config.get("student_num_inference_timesteps"),
+                "allow_ode_cache",
+                self.ode_distill_config.get("allow_ode_cache"),
+                "allow_ode_early_stop",
+                self.ode_distill_config.get("allow_ode_early_stop"),
                 flush=True,
             )
         model.to(device)
@@ -1071,15 +1075,24 @@ class WallxModelWrapper:
             else:
                 num_inference_timesteps = 10
         model_action_dim = sum(self.dof_config.values())
+        runtime_ode_kwargs = {}
+        if getattr(self, "ode_distill_config", {}).get("enable", False):
+            if not self.ode_distill_config.get("allow_ode_cache", False):
+                runtime_ode_kwargs["ode_cache_enable"] = False
+            if not self.ode_distill_config.get("allow_ode_early_stop", False):
+                runtime_ode_kwargs["ode_early_stop_enable"] = False
         if last_action_chunk is None:
             output = self.model.generate_flow_action(
                 action_horizon=self.args.action_horizon,
                 action_dim=model_action_dim,
                 num_inference_timesteps=num_inference_timesteps,
                 unnorm=False,
+                **runtime_ode_kwargs,
                 **inputs,
             )
         else:
+            # RTC flow is not part of the first standalone V6 student pass.
+            # Keep the new V6 isolation kwargs on the normal flow path only.
             output = self.model.generate_flow_action_rtc(
                 action_horizon=self.args.action_horizon,
                 action_dim=model_action_dim,

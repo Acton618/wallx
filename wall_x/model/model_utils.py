@@ -170,6 +170,12 @@ def update_model_config(train_config, model_config):
     model_config.ode_distill_student_num_inference_timesteps = int(
         ode_distill_config.get("student_num_inference_timesteps", 4)
     )
+    model_config.ode_distill_allow_ode_cache = bool(
+        ode_distill_config.get("allow_ode_cache", False)
+    )
+    model_config.ode_distill_allow_ode_early_stop = bool(
+        ode_distill_config.get("allow_ode_early_stop", False)
+    )
     ode_early_stop_config = train_config.get("ode_early_stop", {}) or {}
     model_config.ode_early_stop_enable = bool(
         ode_early_stop_config.get(
@@ -213,6 +219,14 @@ def update_model_config(train_config, model_config):
             "start_step", getattr(model_config, "ode_cache_start_step", 2)
         )
     )
+
+    # V6 first version should run the distilled student by itself. Combined
+    # experiments such as V6+V5 cache must opt in explicitly.
+    if model_config.ode_distill_enable:
+        if not model_config.ode_distill_allow_ode_early_stop:
+            model_config.ode_early_stop_enable = False
+        if not model_config.ode_distill_allow_ode_cache:
+            model_config.ode_cache_enable = False
 
     return model_config
 

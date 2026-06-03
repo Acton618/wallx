@@ -1,0 +1,17 @@
+# Enable this overlay after a V6 student checkpoint has been trained.
+# V6 first version runs the distilled student alone: no V5 cache and no V3 early stop.
+ode_distill:
+  enable: true
+  student_checkpoint_path: /root/autodl-tmp/wall_x/workspace/v6_ode_distill/ode_student_3000train_1000val_step6
+  teacher_num_inference_timesteps: 10
+  student_num_inference_timesteps: 6
+  allow_ode_cache: false
+  allow_ode_early_stop: false
+
+ode_cache:
+  enable: false
+  interval: 2
+  start_step: 2
+
+ode_early_stop:
+  enable: false

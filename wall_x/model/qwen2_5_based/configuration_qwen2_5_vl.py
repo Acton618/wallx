@@ -226,6 +226,10 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         vispruner_predictor_hidden_dim=None,
         vispruner_predictor_dropout=0.0,
         vispruner_predictor_strict_load=True,
+        ode_distill_enable=False,
+        ode_distill_student_num_inference_timesteps=4,
+        ode_distill_allow_ode_cache=False,
+        ode_distill_allow_ode_early_stop=False,
         ode_early_stop_enable=False,
         ode_early_stop_threshold=0.01,
         ode_early_stop_min_steps=2,
@@ -293,6 +297,12 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         self.vispruner_predictor_hidden_dim = vispruner_predictor_hidden_dim
         self.vispruner_predictor_dropout = vispruner_predictor_dropout
         self.vispruner_predictor_strict_load = vispruner_predictor_strict_load
+        self.ode_distill_enable = ode_distill_enable
+        self.ode_distill_student_num_inference_timesteps = (
+            ode_distill_student_num_inference_timesteps
+        )
+        self.ode_distill_allow_ode_cache = ode_distill_allow_ode_cache
+        self.ode_distill_allow_ode_early_stop = ode_distill_allow_ode_early_stop
         self.ode_early_stop_enable = ode_early_stop_enable
         self.ode_early_stop_threshold = ode_early_stop_threshold
         self.ode_early_stop_min_steps = ode_early_stop_min_steps

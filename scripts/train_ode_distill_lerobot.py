@@ -45,10 +45,35 @@ def set_seed(seed: int, device: str):
         torch.cuda.manual_seed_all(seed)
 
 
+def resolve_dataset_root(dataset_root: str, repo_id: str) -> str:
+    root = Path(dataset_root).expanduser()
+    candidates = [root, root / repo_id]
+    for candidate in candidates:
+        if (candidate / "data").exists() and (candidate / "meta").exists():
+            return str(candidate)
+    return str(root)
+
+
+def build_v6_train_config(args, enable_pruning: bool) -> dict:
+    train_config = build_train_config(args, enable_pruning)
+    train_config["ode_distill"] = {
+        "enable": False,
+        "teacher_num_inference_timesteps": args.teacher_num_inference_timesteps,
+        "student_num_inference_timesteps": args.student_num_inference_timesteps,
+        "allow_ode_cache": bool(args.allow_ode_cache_with_distill),
+        "allow_ode_early_stop": bool(args.allow_ode_early_stop_with_distill),
+    }
+    # V6 first version trains/evaluates the student alone. V5 cache and V3
+    # early stop stay off unless explicit combination flags are added later.
+    train_config["ode_cache"] = {"enable": False, "interval": 2, "start_step": 2}
+    train_config["ode_early_stop"] = {"enable": False}
+    return train_config
+
+
 def load_wallx_model(args, enable_pruning: bool, train: bool = False):
     model = Qwen2_5_VLMoEForAction.from_pretrained(
         args.model_path,
-        train_config=build_train_config(args, enable_pruning),
+        train_config=build_v6_train_config(args, enable_pruning),
     )
     model = model.to(args.device)
     if args.device.startswith("cuda"):
@@ -91,7 +116,7 @@ def make_items(args, total_count: int):
 
 
 def flow_call_kwargs(batch, args, num_inference_timesteps: int, profile_timing: bool = False):
-    return dict(
+    kwargs = dict(
         **batch,
         action_dim=args.action_dim,
         action_horizon=args.pred_horizon,
@@ -102,6 +127,11 @@ def flow_call_kwargs(batch, args, num_inference_timesteps: int, profile_timing: 
         profile_timing=profile_timing,
         print_timing=False,
     )
+    if not getattr(args, "allow_ode_cache_with_distill", False):
+        kwargs["ode_cache_enable"] = False
+    if not getattr(args, "allow_ode_early_stop_with_distill", False):
+        kwargs["ode_early_stop_enable"] = False
+    return kwargs
 
 
 def flow_generate_kwargs(batch, args, num_inference_timesteps: int, profile_timing: bool = False):
@@ -273,7 +303,8 @@ def write_eval_report(args, out_dir: Path, metrics):
     lines = [
         "# Wall-X ODE Distillation Report\n",
         f"- model_path: `{args.model_path}`",
-        f"- dataset_root: `{args.dataset_root}`",
+        f"- dataset_root_input: `{getattr(args, 'dataset_root_input', args.dataset_root)}`",
+        f"- dataset_root_resolved: `{args.dataset_root}`",
         f"- repo_id: `{args.repo_id}`",
         f"- image_key: `{args.image_key}`",
         f"- train_samples: `{args.train_samples}`",
@@ -283,6 +314,9 @@ def write_eval_report(args, out_dir: Path, metrics):
         f"- epochs: `{args.epochs}`",
         f"- learning_rate: `{args.learning_rate}`",
         f"- vispruner_enable: `{args.enable_pruning}`",
+        f"- V6 standalone: `{not args.allow_ode_cache_with_distill and not args.allow_ode_early_stop_with_distill}`",
+        f"- allow_ode_cache_with_distill: `{args.allow_ode_cache_with_distill}`",
+        f"- allow_ode_early_stop_with_distill: `{args.allow_ode_early_stop_with_distill}`",
         "",
         "## Summary\n",
         f"- train_eval MAE: `{train.get('mae', 0.0):.6f}`",
@@ -313,10 +347,10 @@ def write_eval_report(args, out_dir: Path, metrics):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default="/root/autodl-tmp/wall_x/pretrained/wall-oss-fast")
-    parser.add_argument("--dataset-root", default="/root/autodl-tmp/wall_x/datasheet/libero_all")
+    parser.add_argument("--dataset-root", default="/root/autodl-tmp/wall_x/datasheet")
     parser.add_argument("--repo-id", default="libero_all")
     parser.add_argument("--image-key", default="observation.images.faceImg")
-    parser.add_argument("--output-dir", default="/root/autodl-tmp/wall_x/workspace/ode_distill_ckpts/ode_student_1000train_200val_step4")
+    parser.add_argument("--output-dir", default="/root/autodl-tmp/wall_x/workspace/v6_ode_distill/ode_student_3000train_1000val_step6")
     parser.add_argument("--train-samples", type=int, default=1000)
     parser.add_argument("--val-samples", type=int, default=200)
     parser.add_argument("--sample-strategy", choices=["linspace", "random"], default="linspace")
@@ -328,7 +362,7 @@ def main():
     parser.add_argument("--predictor-source", default="early_hidden")
     parser.add_argument("--predictor-early-layer", type=int, default=None)
     parser.add_argument("--teacher-num-inference-timesteps", type=int, default=10)
-    parser.add_argument("--student-num-inference-timesteps", type=int, default=4)
+    parser.add_argument("--student-num-inference-timesteps", type=int, default=6)
     parser.add_argument("--action-dim", type=int, default=20)
     parser.add_argument("--pred-horizon", type=int, default=32)
     parser.add_argument("--max-length", type=int, default=2048)
@@ -346,7 +380,23 @@ def main():
     parser.add_argument("--eval-timing-samples", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--regenerate-teacher", action="store_true")
+    parser.add_argument("--allow-ode-cache-with-distill", action="store_true")
+    parser.add_argument("--allow-ode-early-stop-with-distill", action="store_true")
     args = parser.parse_args()
+
+    args.dataset_root_input = args.dataset_root
+    args.dataset_root = resolve_dataset_root(args.dataset_root, args.repo_id)
+    print(
+        f"[ODE_DISTILL][V6] dataset_root={args.dataset_root} "
+        f"input={args.dataset_root_input}",
+        flush=True,
+    )
+    print(
+        "[ODE_DISTILL][V6] standalone student mode: "
+        f"allow_cache={args.allow_ode_cache_with_distill} "
+        f"allow_early_stop={args.allow_ode_early_stop_with_distill}",
+        flush=True,
+    )
 
     set_seed(args.seed, args.device)
     out_dir = Path(args.output_dir)
@@ -359,6 +409,8 @@ def main():
                 "student_checkpoint_path": str(out_dir),
                 "teacher_num_inference_timesteps": args.teacher_num_inference_timesteps,
                 "student_num_inference_timesteps": args.student_num_inference_timesteps,
+                "allow_ode_cache": args.allow_ode_cache_with_distill,
+                "allow_ode_early_stop": args.allow_ode_early_stop_with_distill,
                 "lora": {
                     "enable": True,
                     "r": args.lora_r,
@@ -378,6 +430,12 @@ def main():
             "train_samples": args.train_samples,
             "val_samples": args.val_samples,
             "sample_strategy": args.sample_strategy,
+        },
+        "v6_runtime": {
+            "standalone_student": not args.allow_ode_cache_with_distill
+            and not args.allow_ode_early_stop_with_distill,
+            "ode_cache_enable": False,
+            "ode_early_stop_enable": False,
         },
         "training": {
             "epochs": args.epochs,

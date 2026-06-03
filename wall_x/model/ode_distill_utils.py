@@ -13,6 +13,10 @@ def get_ode_distill_config(config: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("student_checkpoint_path", None)
     cfg.setdefault("teacher_num_inference_timesteps", 10)
     cfg.setdefault("student_num_inference_timesteps", 4)
+    # V6 first version keeps the student path standalone by default. V5 cache
+    # and V3 early stop can be studied later as explicit combination tests.
+    cfg.setdefault("allow_ode_cache", False)
+    cfg.setdefault("allow_ode_early_stop", False)
     cfg.setdefault("lora", {})
     cfg["lora"] = dict(cfg.get("lora") or {})
     cfg["lora"].setdefault("enable", True)
@@ -99,6 +103,19 @@ def apply_ode_distill_checkpoint(model, config: Dict[str, Any], is_trainable: bo
     model.ode_distill_num_inference_timesteps = int(
         cfg.get("student_num_inference_timesteps", 4)
     )
+    model.ode_distill_allow_ode_cache = bool(cfg.get("allow_ode_cache", False))
+    model.ode_distill_allow_ode_early_stop = bool(
+        cfg.get("allow_ode_early_stop", False)
+    )
+
+    # Keep V6 isolated unless the user explicitly asks for a combined
+    # experiment. This prevents a student checkpoint from silently inheriting
+    # V5 cache or V3 early-stop settings from a broader runtime YAML.
+    if hasattr(model, "config"):
+        if not model.ode_distill_allow_ode_cache:
+            model.config.ode_cache_enable = False
+        if not model.ode_distill_allow_ode_early_stop:
+            model.config.ode_early_stop_enable = False
     return model, cfg
 
 
