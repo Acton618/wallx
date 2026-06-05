@@ -547,9 +547,18 @@ def main():
     parser.add_argument("--pred-horizon", type=int, default=32)
     parser.add_argument("--num-inference-timesteps", type=int, default=10)
     parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--report-path", required=True)
-    parser.add_argument("--results-json", required=True)
+    parser.add_argument("--test-run-id", type=int, default=1)
+    parser.add_argument("--report-path", default=None)
+    parser.add_argument("--results-json", default=None)
     args = parser.parse_args()
+
+    output_prefix = f"mid_exam_{args.num_images}_{args.test_run_id}_front_chain"
+    if args.report_path is None:
+        args.report_path = str(REPO_ROOT / "wall_x" / "report" / f"{output_prefix}.md")
+    if args.results_json is None:
+        args.results_json = str(
+            REPO_ROOT / "wall_x" / "report" / f"{output_prefix}_results.json"
+        )
 
     image_items, _ = make_items(args)
     records = {}

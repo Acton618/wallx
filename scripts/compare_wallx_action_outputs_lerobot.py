@@ -248,15 +248,18 @@ def main():
     parser.add_argument("--unnorm", action="store_true")
     parser.add_argument("--profile-timing", action="store_true")
     parser.add_argument("--save-actions", action="store_true")
-    parser.add_argument(
-        "--report-path",
-        default="/root/autodl-tmp/wall_x/workspace/vispruner_logs/action_compare_original_vs_predictor_early_report.md",
-    )
-    parser.add_argument(
-        "--results-json",
-        default="/root/autodl-tmp/wall_x/workspace/vispruner_logs/action_compare_original_vs_predictor_early_results.json",
-    )
+    parser.add_argument("--test-run-id", type=int, default=1)
+    parser.add_argument("--report-path", default=None)
+    parser.add_argument("--results-json", default=None)
     args = parser.parse_args()
+
+    output_prefix = f"mid_exam_{args.num_images}_{args.test_run_id}_action_compare"
+    if args.report_path is None:
+        args.report_path = str(REPO_ROOT / "wall_x" / "report" / f"{output_prefix}.md")
+    if args.results_json is None:
+        args.results_json = str(
+            REPO_ROOT / "wall_x" / "report" / f"{output_prefix}_results.json"
+        )
 
     image_items, _ = make_items(args)
     baseline_records = run_case(args, "baseline_original", False, image_items)
