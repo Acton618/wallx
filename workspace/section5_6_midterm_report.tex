@@ -1,0 +1,392 @@
+\documentclass[UTF8,a4paper,12pt]{ctexart}
+
+\usepackage{geometry}
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.35em}
+\captionsetup[table]{font=small,skip=6pt}
+\setlist[itemize]{leftmargin=2em,itemsep=0.2em}
+
+\title{大创中期报告第5、6部分\\Wall-X 视频输入支持与 ODE 推理优化}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+
+
+\section{调整 Wall-X 数据输入以支持视频流}
+
+\subsection{改造概述}
+
+原始 Wall-X 数据链路主要面向单帧图像输入，即每个相机视角取一帧图像，经由
+\texttt{<|image\_pad|>} 占位符、图像 processor 和视觉编码器进入模型。本部分将输入链路扩展为图像和视频两种模式，使连续多帧 clip 能够通过 Qwen2.5-VL 原生视频入口进入 Wall-X。
+
+视频输入的核心流程如下：
+
+\begin{quote}\small
+\begin{verbatim}
+MP4 / 视频帧序列
+  -> 多帧 clip 解码与整理
+  -> prompt 使用 <|video_pad|> 占位
+  -> processor 生成 pixel_values_videos
+  -> 生成 video_grid_thw 与 second_per_grid_ts
+  -> Video VisPruner / ODE 动作推理
+\end{verbatim}
+\end{quote}
+
+其中，\texttt{video\_grid\_thw} 描述视频 token 的时间、高度、宽度网格结构；\texttt{second\_per\_grid\_ts} 描述时间维度上每个 grid 对应的真实时间间隔，用于支持视频 temporal RoPE。
+
+\subsection{关键实现与接口约束}
+
+视频输入改造集中在数据集读取、collator/processor 和 serving 三处。数据集入口 \texttt{wall\_x/data/load\_lerobot\_dataset.py} 增加 \texttt{media\_type} 配置，当前支持 \texttt{image} 和 \texttt{video} 两种模式；serving 侧同步补充视频 schema，使调用方可以按相机名传入帧序列。
+
+链路实现需要满足以下约束：
+
+\begin{itemize}
+  \item 图像模式使用 \texttt{<|image\_pad|>}、\texttt{pixel\_values} 和 \texttt{image\_grid\_thw}。
+  \item 视频模式使用 \texttt{<|video\_pad|>}、\texttt{pixel\_values\_videos}、\texttt{video\_grid\_thw} 和 \texttt{second\_per\_grid\_ts}。
+  \item 每个相机对应一个 video clip，prompt 中 \texttt{<|video\_pad|>} 的数量需要与 video clip 数量一致。
+  \item \texttt{video\_grid\_thw} 展开的 video token 数需要与视觉 encoder 输出 features 数一致。
+  \item 开启 V4 Video VisPruner 时，需要同步裁剪 video features、video token、attention mask 和 position ids，保证裁剪后仍满足 token/features 对齐要求。
+\end{itemize}
+
+本节只描述视频输入接口和处理链路，Video VisPruner 的耗时与精度对比结果放在前面视觉 token 筛选部分讨论；后续主要分析 ODE 动作推理优化。
+
+\subsection{图像与视频输入链路验证}
+
+图像模式使用单帧视觉 token，视频模式使用连续多帧 clip 形成带时间维度的视频 token。二者最终进入同一个动作生成接口，但视觉 token 构造、prompt 占位符和 RoPE 时间信息不同。
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{图像输入与视频输入链路验证结果}
+\begin{tabular}{lll}
+\toprule
+指标 & 图像输入 & 视频输入 \\
+\midrule
+输入内容 & 第 59 帧双相机图像 & 第 56--59 帧双相机视频 clip \\
+动作输出形状 & \texttt{[1, 32, 20]} & \texttt{[1, 32, 20]} \\
+视觉 token/features & \texttt{162 / 162} & \texttt{324 / 324} \\
+视觉 grid & \texttt{[[1,18,18],[1,18,18]]} & \texttt{[[2,18,18],[2,18,18]]} \\
+\texttt{second\_per\_grid\_ts} & 无 & \texttt{[0.0667, 0.0667]} \\
+token/features 是否匹配 & True & True \\
+动作差异 & \multicolumn{2}{l}{前三步前 7 维 mean abs diff 为 0.027409} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+验证结果表明，视频路径中 token 数与 features 数能够严格匹配，且模型输入包含 \texttt{pixel\_values\_videos}、\texttt{video\_grid\_thw} 和 \texttt{second\_per\_grid\_ts}，可直接进入后续 Video VisPruner 和 ODE 推理链路。
+
+\section{Wall-X 的 ODE 推理部分优化}
+
+\subsection{原始固定步数 ODE 推理}
+
+Wall-X 的 Flow Matching 动作生成不是一次性直接输出动作，而是先采样一个随机的 \texttt{noisy\_action}，再通过多步 ODE 更新逐渐得到最终动作。原始推理通常使用固定 10 次更新，可以表示为：
+
+\begin{quote}\small
+\begin{verbatim}
+noisy_action
+  -> prefetch: t = 0 首次更新
+  -> postfix ODE step 1
+  -> postfix ODE step 2
+  -> ...
+  -> postfix ODE step 9
+  -> final action
+\end{verbatim}
+\end{quote}
+
+从 Flow Matching 角度看，模型学习的是一个条件速度场 \(v_\theta(x_t,t,c)\)，其中 \(x_t\) 表示当前动作轨迹状态，\(t\) 是 ODE 时间，\(c\) 是由语言、图像/视频和本体状态组成的条件信息。推理时从随机噪声动作 \(x_0\) 出发，使用 Euler 形式逐步更新：
+
+\begin{equation}
+x_{t+\Delta t}=x_t+\Delta t \cdot v_\theta(x_t,t,c).
+\end{equation}
+
+在 Wall-X 的实现中，第一次 \(t=0\) 更新与完整多模态前缀一起计算，称为 prefetch；后续 step 只保留 action 相关 postfix token，并复用前缀 KV cache 进行多次 ODE 更新。该机制避免每一步重复计算视觉和语言前缀，但 postfix transformer 仍需要被多次调用，因此 ODE 循环仍然是主要耗时来源。
+
+\begin{quote}\small
+\begin{verbatim}
+# Original fixed_10 ODE pseudo code
+x = random_noise_action()
+
+# prefetch step: full multimodal sequence
+v0, prefix_kv = transformer_full_prefix(x, t=0, image_or_video, text, state)
+x = x + dt * v0
+
+# postfix steps: action tokens reuse prefix_kv
+for t in times[1:-1]:
+    action_embed = action_preprocessor(x, t)
+    vt = transformer_postfix(action_embed, prefix_kv)
+    x = x + dt * vt
+
+return x
+\end{verbatim}
+\end{quote}
+
+基于该瓶颈，当前完成了两类推理期优化：早停和速度复用。二者都围绕 postfix ODE 循环展开，目标是在尽量不改变动作结果的前提下降低重复计算成本。student 蒸馏和安全回退机制目前放在未来方向中，作为后续进一步压缩步数和保证稳定性的路线。
+
+实验评估使用 \texttt{fixed\_10} 作为基准，动作误差采用 action MAE 计算：
+
+\begin{equation}
+\mathrm{MAE}=\frac{1}{NHD}\sum_{n=1}^{N}\sum_{h=1}^{H}\sum_{d=1}^{D}
+\left|a^{\mathrm{test}}_{n,h,d}-a^{\mathrm{fixed10}}_{n,h,d}\right|,
+\end{equation}
+
+其中 \(N\) 为样本数，\(H\) 为动作预测 horizon，\(D\) 为动作维度。MAE 越小，说明优化版本与原始固定 10 步推理越接近。
+
+\subsection{版本一：ODE 早停}
+
+\subsubsection{方法原理}
+
+V3 引入 ODE 早停。如果相邻 ODE step 之间的动作变化低于阈值，则提前停止后续 ODE 更新。判定条件为：
+
+\begin{equation}
+\left\|a_t-a_{t-1}\right\| < \epsilon,
+\end{equation}
+
+其中 \(\epsilon\) 为早停阈值。代码实现中支持 \texttt{mean\_abs}、\texttt{max\_abs} 和 \texttt{l2} 三类度量，并通过 \texttt{min\_steps} 和 \texttt{patience} 控制早停触发时机。
+
+早停逻辑位于 \texttt{modeling\_qwen2\_5\_vl\_act.py} 的 \texttt{generate\_flow\_action()} 中，配置项包括 \texttt{ode\_early\_stop\_enable}、\texttt{ode\_early\_stop\_threshold}、\texttt{ode\_early\_stop\_min\_steps} 和 \texttt{ode\_early\_stop\_patience}。需要注意的是，Wall-X 原始代码在进入 postfix ODE 循环前已经完成了一次 \(t=0\) 的 prefetch 更新，因此早停循环不能从头重新多走一步，否则会出现 off-by-one 的步数错误。
+
+\begin{quote}\small
+\begin{verbatim}
+# V3 early stop pseudo code
+x = x_after_prefetch       # prefetch has already advanced one step
+actual_steps = 1
+no_change_count = 0
+
+for each postfix timestep:
+    x_prev = x
+    v = step_with_kvcache(t, x)  # here cache is normally disabled for V3
+    x = x + dt * v
+    actual_steps += 1
+
+    delta = metric(abs(x - x_prev))
+    if actual_steps >= min_steps and delta < threshold:
+        no_change_count += 1
+    else:
+        no_change_count = 0
+
+    if no_change_count >= patience:
+        break
+\end{verbatim}
+\end{quote}
+
+\subsubsection{实验结果}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{视频数据集上 ODE 早停结果，基准为 fixed\_10}
+\begin{tabular}{lrrrrr}
+\toprule
+方法 & 总耗时/ms & ODE耗时/ms & 实际更新步数 & 停止率 & Action MAE \\
+\midrule
+\texttt{fixed\_10} & 362.713 & 287.645 & 10.00 & 0.00\% & 0.000000 \\
+\texttt{early\_safe} & 360.721 & 286.249 & 10.00 & 0.00\% & 0.000000 \\
+\texttt{early\_tradeoff} & 296.564 & 222.011 & 8.00 & 100.00\% & 0.519164 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+实验结果显示，保守早停配置 \texttt{early\_safe} 基本不会触发，耗时下降有限；激进配置 \texttt{early\_tradeoff} 将 ODE 更新从 10 步减少到 8 步，总耗时降低约 18.24\%，但 action MAE 达到 0.519164，动作结果与原始固定步数推理差异较大。因此，早停的效果受阈值影响较大，单独使用时稳定性不足。
+
+\subsection{版本二：ODE Velocity Cache 复用中间结果}
+
+\subsubsection{方法原理}
+
+早停会直接减少 ODE 步数，可能改变动作生成轨迹。V5 进一步采用速度复用策略：不提前终止 ODE 轨迹，而是在部分相邻 step 中复用上一次计算得到的速度 \(v_t\)。其依据是相邻时间步的速度场通常变化比较平滑，不一定每一步都要重新经过完整 transformer 计算。
+
+\begin{quote}\small
+\begin{verbatim}
+fixed_10:
+  step1 refresh
+  step2 refresh
+  step3 refresh
+  ...
+
+cache_i2:
+  step1 refresh
+  step2 refresh
+  step3 reuse previous velocity
+  step4 refresh
+  step5 reuse previous velocity
+  ...
+\end{verbatim}
+\end{quote}
+
+代码实现中，\texttt{step\_with\_kvcache()} 维护 \texttt{last\_velocity} 和 \texttt{last\_refresh\_step}。当当前 step 满足 cache 命中条件时，直接返回缓存速度；否则重新经过 action embedding、postfix transformer 和 action head 计算新的速度。
+
+\begin{quote}\small
+\begin{verbatim}
+# V5 velocity cache pseudo code
+last_velocity = None
+last_refresh_step = None
+
+for step_i, t in enumerate(postfix_times):
+    if cache_enabled and last_velocity is not None:
+        hit = (step_i >= cache_start_step) and \
+              (step_i - last_refresh_step < cache_interval)
+    else:
+        hit = False
+
+    if hit:
+        v = last_velocity              # cheap path: reuse velocity
+        cache_hits += 1
+    else:
+        v = transformer_postfix(x, t)  # expensive path: refresh velocity
+        last_velocity = detach(v)
+        last_refresh_step = step_i
+        cache_refreshes += 1
+
+    x = x + dt * v
+\end{verbatim}
+\end{quote}
+
+与早停相比，V5 的关键区别是它仍然保留固定的 ODE 时间网格，只是减少部分 step 的 velocity 重新计算。因此，V5 更像是在原始推理路径上做近似复用，而不是直接截断推理过程。
+
+\subsubsection{实验结果}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{视频数据集上 V5 ODE Velocity Cache 结果，基准为 fixed\_10}
+\begin{tabular}{lrrrrrrr}
+\toprule
+方法 & 总耗时/ms & 总耗时降幅 & ODE耗时/ms & ODE降幅 & Cache命中率 & Action MAE & Max Abs \\
+\midrule
+\texttt{fixed\_10} & 369.372 & 0.00\% & 291.709 & 0.00\% & 0.00\% & 0.000000 & 0.000000 \\
+\texttt{cache\_i2} & 238.762 & -35.36\% & 162.192 & -44.40\% & 44.44\% & 0.008320 & 0.035004 \\
+\texttt{cache\_i3} & 176.839 & -52.12\% & 99.170 & -66.00\% & 66.67\% & 0.013822 & 0.054817 \\
+\texttt{early\_tradeoff} & 306.465 & -17.03\% & 228.815 & -21.56\% & 0.00\% & 0.519293 & 1.479059 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+实验结果显示，V5 复用策略在耗时和精度之间取得更好的平衡。\texttt{cache\_i2} 将总耗时降低约 35.36\%，ODE 耗时降低约 44.40\%，同时 action MAE 为 0.008320；\texttt{cache\_i3} 进一步提升速度，但误差略有增加。与早停相比，V5 不改变固定步数的整体积分结构，而是在部分 step 复用速度，因此对动作结果的扰动更小。综合耗时和误差，\texttt{cache\_i2} 作为当前阶段的推荐配置。
+
+
+\subsection{未来方向：V6 Student 学习与 V7 安全回退}
+
+当前阶段正式对比实验聚焦于 V3 早停和 V5 速度复用。V6 和 V7 归入未来方向：V6 的初版代码已完成 smoke test，但尚未完成正式训练；V7 处于方案设计阶段，目标是在 V6/V5 的基础上进一步兼顾速度和稳定性。
+
+\subsubsection{V6 Student 学习：用少步模型学习 fixed\_10}
+
+V6 的目标是训练一个 student，使其用更少的 ODE 步数逼近原始 \texttt{fixed\_10} 的输出。teacher 使用 10 步生成相对稳定的动作结果，student 学习用 6 步得到接近的动作。它和 V3、V5 的区别在于：V3/V5 是推理时的技巧，不需要重新训练；V6 是训练阶段的方法，需要先准备 teacher 标签，再训练 student。
+
+\begin{equation}
+\mathcal{L}=\mathrm{SmoothL1}\left(a^{\mathrm{student}}_{6\text{-step}}, a^{\mathrm{teacher}}_{10\text{-step}}\right).
+\end{equation}
+
+\begin{quote}\small
+\begin{verbatim}
+# V6 future plan pseudo code
+# Stage 1: use fixed_10 as teacher
+for sample in training_dataset:
+    teacher_action = fixed_10_teacher(sample)
+    save(sample, teacher_action)
+
+# Stage 2: train a 6-step student
+freeze(base_wallx_model)
+add_lora_to_small_trainable_parts()
+
+for epoch in epochs:
+    for sample, teacher_action in dataset:
+        student_action = student_6_step(sample)
+        loss = SmoothL1(student_action, teacher_action)
+        update_student(loss)
+
+# Stage 3: compare with fixed_10
+report latency, action_MAE, max_abs_error, rollout_success_rate
+\end{verbatim}
+\end{quote}
+
+V6 初版链路验证已完成，当前默认不与 V5 cache 或 V3 early stop 自动叠加。该设计用于验证 student 独立链路，后续再考虑和 V5 复用策略组合。
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{V6 Student 初版 smoke 状态}
+\begin{tabular}{ll}
+\toprule
+项目 & 状态 \\
+\midrule
+数据入口 & \texttt{/root/autodl-tmp/wall\_x/datasheet} \\
+解析后数据集 & \texttt{/root/autodl-tmp/wall\_x/datasheet/libero\_all} \\
+Teacher 步数 & 10 \\
+Student 步数 & 6 \\
+是否叠加 V5 cache & 否 \\
+是否叠加 V3 early stop & 否 \\
+Smoke epoch & 0，仅验证链路 \\
+Smoke val MAE & 1.143421，仅为未训练结果 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+表中的 \texttt{Smoke val MAE} 只代表未训练 student 的链路检查结果，不能作为最终精度结论。下一步需要使用更多样本进行正式训练，再和 \texttt{fixed\_10} 在耗时、action MAE 和 rollout success rate 上做对比。
+
+\subsubsection{V7 安全回退：先快跑，再校验}
+
+V7 是 V6 之后的后续方向。其思路是先用快速路径生成候选动作，再判断结果是否可靠；如果可靠就直接输出，如果不可靠就回退到 \texttt{fixed\_10} 或更保守的路径。该机制使低难度样本节省推理时间，同时保留复杂样本的稳定推理路径。
+
+\begin{quote}\small
+\begin{verbatim}
+# V7 future plan pseudo code
+fast_action = fast_policy(sample)
+# fast_policy can be V5 cache_i2, trained V6 student_6,
+# or a controlled combination of both.
+
+confidence = verifier(fast_action, sample)
+# verifier can check action norm, velocity residual,
+# uncertainty score, or periodic fixed_10 consistency.
+
+if confidence >= threshold:
+    return fast_action
+else:
+    return fixed_10_policy(sample)
+\end{verbatim}
+\end{quote}
+
+V7 的核心模块是 verifier，用于判断快速结果是否可信。后续评估应优先统计 fast path 接受率、fallback 比例、平均耗时、action MAE 以及 LIBERO rollout success rate。如果快速路径接受率较高，且回退后的整体精度接近 \texttt{fixed\_10}，则该路线具有继续验证的价值。
+
+\begin{table}[H]
+\centering
+\small
+\caption{V6 与 V7 未来方向设计}
+\begin{tabular}{lll}
+\toprule
+方向 & 目标问题 & 评估重点 \\
+\midrule
+V6 Student & 用 6 步 student 学习 10 步 teacher & 训练后 MAE、耗时、rollout 成功率 \\
+V7 Fast path & 低难度样本先走快速路径 & fast path 接受率、平均耗时 \\
+V7 Verifier & 判断快速动作是否可靠 & 回退率、误判率、动作偏差 \\
+V7 Fallback & 不可靠时回到稳定路径 & 精度是否接近 fixed\_10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{本部分小结}
+
+第 5、6 部分主要包括两项工作。第一，将 Wall-X 的输入从单帧图像扩展到真实视频 clip，使视频能够通过 \texttt{pixel\_values\_videos}、\texttt{video\_grid\_thw} 和 \texttt{second\_per\_grid\_ts} 进入模型。第二，围绕 ODE 多步动作推理完成两类已验证优化：V3 早停和 V5 velocity cache。实验结果显示，早停受阈值影响较大，激进配置会带来明显动作偏差；V5 在保持固定步数结构的前提下复用部分速度结果，能够显著降低 ODE 推理耗时，同时保持较小动作误差。后续工作包括 V6 student 蒸馏和 V7 安全回退，评估重点为推理耗时、action MAE 和 rollout 成功率。
+
+\end{document}

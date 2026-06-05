@@ -33,15 +33,14 @@ epoch_save_interval: 10
 FSDP2: True
 torch_compile: False
 
-# Visual token pruning. Defaults keep the original Wall-X image path.
+# Visual token pruning. V4 enables video pruning for video-mode experiments.
 vispruner:
-  enable: false
-  strategy: original
-  keep_ratio: 1.0
+  enable: true
+  strategy: topk_attention
+  keep_ratio: 0.5
   min_tokens: 1
   force_vision_eager: true
-  # V4 video VisPruner. Disabled by default to preserve V1/V2 video outputs.
-  prune_video: false
+  prune_video: true
 
 # ODE distillation student switch. Disabled by default to keep original Wall-X inference.
 ode_distill:

@@ -1,0 +1,113 @@
+log_name: bridge_v2_smoke
+log_project: vla_bridge_v2_smoke
+model_type: qwen2_5
+pretrained_wallx_path: /root/autodl-tmp/wall_x/pretrained/wall-oss-fast
+save_path: /root/autodl-tmp/wall_x/workspace/bridge_v2_smoke
+use_fast_tokenizer: true
+action_tokenizer_path: /root/autodl-tmp/fast
+qwen_vl_act_config_path: /root/autodl-tmp/wall_x/workspace/lerobot_example/qwen25_config.json
+profile: false
+profile_save_path: /path/to/profile/
+profile_wait_iters: 10
+profile_warmup_iters: 5
+profile_active_iters: 2
+num_warmup_steps: 100
+num_training_steps: 10
+learning_rate: 9.0e-05
+min_lr: 5.0e-05
+num_epoch: 1
+gradient_accumulation_steps: 1
+batch_size_per_gpu: 1
+padding_side: left
+epoch_save_interval: 999999
+FSDP2: false
+torch_compile: false
+vispruner:
+  enable: true
+  strategy: topk_attention
+  keep_ratio: 0.5
+  min_tokens: 1
+  force_vision_eager: true
+  prune_video: true
+ode_distill:
+  enable: false
+  student_checkpoint_path: null
+  teacher_num_inference_timesteps: 10
+  student_num_inference_timesteps: 6
+  allow_ode_cache: false
+  allow_ode_early_stop: false
+  lora:
+    enable: true
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    target_modules:
+    - q_proj
+    - v_proj
+ode_early_stop:
+  enable: false
+  threshold: 0.01
+  min_steps: 2
+  metric: mean_abs
+  patience: 1
+ode_cache:
+  enable: false
+  interval: 2
+  start_step: 2
+dof_config:
+  follow_right_ee_cartesian_pos: 3
+  follow_right_ee_rotation: 3
+  follow_right_gripper: 1
+agent_pos_config:
+  follow_right_ee_cartesian_pos: 3
+  follow_right_ee_rotation: 3
+  follow_right_gripper: 1
+norm_stats_path: null
+enable_customized_robot_config: true
+customized_robot_config:
+  name: bridge_data_v2
+  customized_dof_config:
+    follow_right_ee_cartesian_pos: 3
+    follow_right_ee_rotation: 3
+    follow_right_gripper: 1
+  customized_agent_pos_config:
+    follow_right_ee_cartesian_pos: 3
+    follow_right_ee_rotation: 3
+    follow_right_gripper: 1
+data:
+  use_lerobot: true
+  lerobot_config:
+    repo_id: bridge_data_v2
+    root: /root/autodl-tmp/datasets/bridge_v2_lerobot
+    episodes:
+    - 0
+    image_transforms: null
+    delta_timestamps: null
+    tolerance_s: 1e-4
+    revision: null
+    force_cache_sync: false
+    download_videos: true
+    video_backend: pyav
+  action_horizon: 32
+  train_test_split: 0.95
+  media_type: image
+  video_num_frames: 8
+  video_stride: 1
+  obs_action_keys:
+  - follow_right_ee_cartesian_pos
+  - follow_right_ee_rotation
+  - follow_right_gripper
+  predict_action_keys:
+  - follow_right_ee_cartesian_pos
+  - follow_right_ee_rotation
+  - follow_right_gripper
+  resolution:
+    face_view: 256
+    left_wrist_view: 256
+    right_wrist_view: 256
+    move1_view: 256
+    move2_view: 256
+    top_view: 256
+    wall_view: 256
+    multi_modal: 256
+num_workers: 0

@@ -611,11 +611,18 @@ def load_lerobot_data(
         repo_id, dataset_fps, dataload_config
     )
     batch_size = config.get("batch_size_per_gpu", 8)
-    episodes = np.arange(episodes_num).tolist()
-
-    train_test_split = dataload_config.get("train_test_split", 0.95)
-    train_episodes = episodes[: int(episodes_num * train_test_split)]
-    test_episodes = episodes[int(episodes_num * train_test_split) :]
+    configured_episodes = lerobot_config.get("episodes", None)
+    if configured_episodes is None:
+        episodes = np.arange(episodes_num).tolist()
+        train_test_split = dataload_config.get("train_test_split", 0.95)
+        train_episodes = episodes[: int(episodes_num * train_test_split)]
+        test_episodes = episodes[int(episodes_num * train_test_split) :]
+    else:
+        episodes = list(configured_episodes)
+        if not episodes:
+            raise ValueError("lerobot_config.episodes must not be empty when provided.")
+        train_episodes = episodes
+        test_episodes = []
 
     train_dataset = LeRobotDataset(
         repo_id,

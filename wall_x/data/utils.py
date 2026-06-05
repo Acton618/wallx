@@ -68,6 +68,13 @@ KEY_MAPPINGS = {
         "state": "observation.state",
         "action": "action",
     },
+    "bridge_data_v2": {
+        "camera": {
+            "observation.images.image_0": "face_view",
+        },
+        "state": "observation.state",
+        "action": "action",
+    },
 }
 
 CAMERA_NAME_MAPPING = {

@@ -33,6 +33,77 @@ FRONT_TOP_LEVEL_KEYS = (
     "position_encoding",
     "prefetch_forward",
 )
+DOWNSTREAM_TOKEN_KEYS = (
+    "scatter_image_embeds",
+    "position_encoding",
+    "prefill_transformer",
+)
+FLAT_FRONT_CHAIN_STAGES = (
+    (
+        "s01_image_cast",
+        ("image_cast",),
+        "Cast pixel_values to the vision tower dtype.",
+    ),
+    (
+        "s02_vision_encode_or_prune",
+        (
+            "vision_image_encode",
+            "vision_image_encode_score",
+            "vision_image_encode_early_prune",
+        ),
+        "Run the active vision path: original encode, attention-score encode, or early-prune encode.",
+    ),
+    (
+        "s03_pruning_position_prepare",
+        ("pruning_position_ids_prepare",),
+        "Prepare position ids before sequence pruning. Zero for non-pruned baseline.",
+    ),
+    (
+        "s04_apply_pruning",
+        ("vispruner_total",),
+        "Apply token keep mask to image embeds and sequence tensors. Zero for non-pruned baseline.",
+    ),
+    (
+        "s05_embed_tokens",
+        ("embed_tokens",),
+        "Embed text/control placeholder token ids.",
+    ),
+    (
+        "s06_scatter_image_embeds",
+        ("scatter_image_embeds",),
+        "Write image embeddings into image-token positions.",
+    ),
+    (
+        "s07_scatter_proprioception",
+        ("scatter_proprioception",),
+        "Write proprioception embeddings into proprioception-token positions.",
+    ),
+    (
+        "s08_attention_mask_to_device",
+        ("attention_mask_to_device",),
+        "Move attention mask to the model device.",
+    ),
+    (
+        "s09_position_and_moe_index",
+        ("position_encoding",),
+        "Prepare position encoding and MoE token grouping.",
+    ),
+    (
+        "s10_action_initialization",
+        ("action_initialization",),
+        "Initialize noisy action and write initial action embeddings.",
+    ),
+    (
+        "s11_prefill_transformer",
+        ("prefill_transformer",),
+        "Run the main transformer prefill.",
+    ),
+    (
+        "s12_prefill_action_head",
+        ("prefill_action_head",),
+        "Run the first action head projection after prefill.",
+    ),
+)
 
 
 @torch.no_grad()
@@ -244,6 +315,7 @@ def summarize(records):
     timings = average_dict([record["timings_ms"] for record in records])
     front_direct = sum(timings.get(key, 0.0) for key in FRONT_DIRECT_KEYS)
     front_top_level = sum(timings.get(key, 0.0) for key in FRONT_TOP_LEVEL_KEYS)
+    downstream_token = sum(timings.get(key, 0.0) for key in DOWNSTREAM_TOKEN_KEYS)
     return {
         "num_samples": len(records),
         "tokens_before": mean(record["tokens_before"] for record in records),
@@ -253,6 +325,7 @@ def summarize(records):
         ),
         "front_direct_ms": front_direct,
         "front_top_level_ms": front_top_level,
+        "downstream_token_ms": downstream_token,
         "timings_ms": timings,
     }
 
@@ -332,20 +405,49 @@ def write_outputs(args, records, timing_counts):
         "timing_counts": timing_counts,
         "front_direct_keys": FRONT_DIRECT_KEYS,
         "front_top_level_keys": FRONT_TOP_LEVEL_KEYS,
+        "downstream_token_keys": DOWNSTREAM_TOKEN_KEYS,
+        "flat_front_chain_stages": [
+            {"name": name, "keys": keys, "description": description}
+            for name, keys, description in FLAT_FRONT_CHAIN_STAGES
+        ],
     }
     results_path = Path(args.results_json)
     results_path.parent.mkdir(parents=True, exist_ok=True)
     results_path.write_text(json.dumps(output, indent=2, ensure_ascii=False))
 
-    def stage_line(stage):
-        b = summaries["baseline"]["timings_ms"].get(stage, 0.0)
-        p = summaries["pruned"]["timings_ms"].get(stage, 0.0)
-        delta = p - b
-        pct = delta / b * 100.0 if b else 0.0
-        return f"| `{stage}` | {b:.3f} | {p:.3f} | {delta:+.3f} | {pct:+.2f}% |"
+    def metric_value(summary, metric):
+        if metric in summary:
+            return summary[metric]
+        return summary["timings_ms"].get(metric, 0.0)
+
+    def delta_pct(delta, baseline):
+        return delta / baseline * 100.0 if baseline else 0.0
+
+    def direction(delta):
+        if delta < -1e-6:
+            return "decrease"
+        if delta > 1e-6:
+            return "increase"
+        return "flat"
+
+    def flat_stage_value(summary, keys):
+        return sum(summary["timings_ms"].get(key, 0.0) for key in keys)
+
+    def flat_stage_line(order, name, keys, description):
+        bv = flat_stage_value(summaries["baseline"], keys)
+        pv = flat_stage_value(summaries["pruned"], keys)
+        delta = pv - bv
+        return (
+            f"| {order} | `{name}` | {bv:.3f} | {pv:.3f} | "
+            f"{delta:+.3f} | {delta_pct(delta, bv):+.2f}% | "
+            f"{direction(delta)} | {description} |"
+        )
 
     b = summaries["baseline"]
     p = summaries["pruned"]
+    token_drop = b["tokens_after"] - p["tokens_after"]
+    token_drop_pct = token_drop / b["tokens_after"] * 100.0 if b["tokens_after"] else 0.0
+    total_delta = metric_value(p, "total_time") - metric_value(b, "total_time")
     lines = [
         "# Wall-X VisPruner Front-Chain Timing Report",
         "",
@@ -365,43 +467,46 @@ def write_outputs(args, records, timing_counts):
         "## Summary",
         "",
         f"- tokens: baseline `{b['tokens_after']:.2f}`, pruned `{p['tokens_after']:.2f}`",
-        f"- front_direct_ms: baseline `{b['front_direct_ms']:.3f}`, pruned `{p['front_direct_ms']:.3f}`, delta `{p['front_direct_ms'] - b['front_direct_ms']:+.3f}`",
-        f"- front_top_level_ms: baseline `{b['front_top_level_ms']:.3f}`, pruned `{p['front_top_level_ms']:.3f}`, delta `{p['front_top_level_ms'] - b['front_top_level_ms']:+.3f}`",
+        f"- token_drop: `{token_drop:.2f}` (`{token_drop_pct:.2f}%`)",
+        f"- front_chain_total_time: baseline `{metric_value(b, 'total_time'):.3f}`, pruned `{metric_value(p, 'total_time'):.3f}`, delta `{total_delta:+.3f}`",
         "",
-        "## Stage Timings",
+        "## Sequential Front-Chain Stages",
         "",
-        "| stage | baseline_ms | pruned_ms | delta_ms | delta_pct |",
-        "|---|---:|---:|---:|---:|",
+        "These rows describe the front-chain execution as a flat pipeline. "
+        "`front_chain_total_time` is the final total timestamp for this front-chain profiler.",
+        "",
+        "| order | stage | baseline_ms | pruned_ms | delta_ms | delta_pct | direction | meaning |",
+        "|---:|---|---:|---:|---:|---:|---|---|",
     ]
-    stages = [
-        "external_prepare_batch_ms",
-        "embed_processing",
-        "image_path_total",
-        "vision_image_forward",
-        "vision_image_encode",
-        "vision_image_encode_score",
-        "vision_image_encode_early_prune",
-        "vispruner_predictor_score",
-        "vispruner_total",
-        "pruning_position_ids_prepare",
-        "scatter_image_embeds",
-        "position_encoding",
-        "prefetch_forward",
-        "prefill_transformer",
-        "prefill_action_head",
-        "total_time",
-    ]
-    for stage in stages:
-        if stage == "external_prepare_batch_ms":
-            bv = b[stage]
-            pv = p[stage]
-            delta = pv - bv
-            pct = delta / bv * 100.0 if bv else 0.0
-            lines.append(
-                f"| `{stage}` | {bv:.3f} | {pv:.3f} | {delta:+.3f} | {pct:+.2f}% |"
-            )
-        else:
-            lines.append(stage_line(stage))
+    flat_baseline_sum = 0.0
+    flat_pruned_sum = 0.0
+    for order, (name, keys, description) in enumerate(FLAT_FRONT_CHAIN_STAGES, start=1):
+        flat_baseline_sum += flat_stage_value(summaries["baseline"], keys)
+        flat_pruned_sum += flat_stage_value(summaries["pruned"], keys)
+        lines.append(flat_stage_line(order, name, keys, description))
+    baseline_unattributed = metric_value(b, "total_time") - flat_baseline_sum
+    pruned_unattributed = metric_value(p, "total_time") - flat_pruned_sum
+    unattributed_delta = pruned_unattributed - baseline_unattributed
+    lines.extend(
+        [
+            f"| 13 | `s13_unattributed_framework_overhead` | {baseline_unattributed:.3f} | {pruned_unattributed:.3f} | {unattributed_delta:+.3f} | {delta_pct(unattributed_delta, baseline_unattributed):+.2f}% | {direction(unattributed_delta)} | Small untracked gaps between explicit stages; kept so the pipeline sums to total_time. |",
+            f"| total | `front_chain_total_time` | {metric_value(b, 'total_time'):.3f} | {metric_value(p, 'total_time'):.3f} | {total_delta:+.3f} | {delta_pct(total_delta, metric_value(b, 'total_time')):+.2f}% | {direction(total_delta)} | Final total timestamp for front-chain profiling. |",
+            "",
+            "## Timestamp Definitions",
+            "",
+            "| order | timestamp | meaning in the front token-processing chain |",
+            "|---:|---|---|",
+        ]
+    )
+    for order, (name, _, description) in enumerate(FLAT_FRONT_CHAIN_STAGES, start=1):
+        lines.append(f"| {order} | `{name}` | {description} |")
+    lines.extend(
+        [
+            "| 13 | `s13_unattributed_framework_overhead` | Small untracked gaps between explicit stages; kept so the pipeline sums to `front_chain_total_time`. |",
+            "| total | `front_chain_total_time` | Final total timestamp from entering the model front chain to finishing `prefill_action_head`. |",
+            "",
+        ]
+    )
 
     report_path = Path(args.report_path)
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -414,7 +519,7 @@ def main():
     parser.add_argument("--dataset-root", default="/root/autodl-tmp/wall_x/datasheet/libero_all")
     parser.add_argument("--repo-id", default="libero_all")
     parser.add_argument("--image-key", default="observation.images.faceImg")
-    parser.add_argument("--num-images", type=int, default=200)
+    parser.add_argument("--num-images", type=int, default=300)
     parser.add_argument("--num-videos", type=int, default=0)
     parser.add_argument("--video-frames", type=int, default=8)
     parser.add_argument("--warmup-samples", type=int, default=5)
@@ -425,16 +530,19 @@ def main():
     parser.add_argument("--image-max-pixels", type=int, default=None)
     parser.add_argument(
         "--pruned-strategy",
-        default="topk_attention",
+        default="predictor_early",
         choices=["topk_attention", "predictor_score", "predictor_early", "norm"],
     )
-    parser.add_argument("--predictor-checkpoint", default=None)
+    parser.add_argument(
+        "--predictor-checkpoint",
+        default="/root/autodl-tmp/wall_x/workspace/vispruner_teacher_scores/token_score_predictor_30000_early_l8.pt",
+    )
     parser.add_argument(
         "--predictor-source",
         default="early_hidden",
         choices=["image_embeds", "patch_embeds", "early_hidden"],
     )
-    parser.add_argument("--predictor-early-layer", type=int, default=None)
+    parser.add_argument("--predictor-early-layer", type=int, default=8)
     parser.add_argument("--action-dim", type=int, default=20)
     parser.add_argument("--pred-horizon", type=int, default=32)
     parser.add_argument("--num-inference-timesteps", type=int, default=10)
